@@ -1,0 +1,60 @@
+# Full RLVR training — Qwen/Qwen3-4B on phy-rl-base, 4× H100 80 GB.
+# Run:
+#   HF_TOKEN=<token> uv run rl @ examples/phy_rl/rl.toml \
+#     --wandb.project phy-rl --wandb.name phy-rl-qwen3-4b-<date>
+
+max_steps = 500
+seq_len = 16384
+
+[wandb]
+project = "phy-rl"
+name = "phy-rl-qwen3-4b"
+
+[deployment]
+num_train_gpus = 2
+num_infer_gpus = 2
+
+[ckpt]  # save final weights
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[orchestrator]
+# 128 rollouts / 8 per example = 16 unique problems per step
+batch_size = 128
+rollouts_per_example = 8
+
+[orchestrator.sampling]
+max_tokens = 8192
+temperature = 0.7
+# Qwen3 thinking mode — enable for deeper chain-of-thought reasoning.
+# Remove if your vLLM build does not support enable_thinking for this model.
+extra_body = { enable_thinking = true }
+
+[[orchestrator.env]]
+id = "phy-env"
+name = "phy-rl"
+# All reliable sources; phybench and image questions filtered automatically.
+# To restrict: args = { sources = "olympiadbench_physics,ipho_open_train" }
+
+[orchestrator.eval]
+interval = 50
+
+[[orchestrator.eval.env]]
+id = "phy-env"
+name = "phy-rl-eval"
+
+[trainer.model]
+impl = "auto"
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+lr = 1e-6
+
+[inference.model]
+max_model_len = 16384
+
+[inference.parallel]
+dp = 2

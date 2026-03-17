@@ -1,0 +1,10 @@
+[project]
+name = "phy-env"
+version = "0.1.0"
+description = "Physics RLVR environment for prime-rl"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets",
+    "verifiers",
+    "sympy",
+]

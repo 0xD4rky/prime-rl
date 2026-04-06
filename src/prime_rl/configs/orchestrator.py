@@ -14,6 +14,7 @@ from prime_rl.configs.shared import (
     WandbWithExtrasConfig,
 )
 from prime_rl.utils.config import BaseConfig
+from prime_rl.utils.logger import get_logger
 
 
 class OptimizerConfig(BaseConfig):
@@ -127,9 +128,10 @@ class SamplingConfig(BaseConfig):
         ),
     ] = 1.0
 
-    max_tokens: Annotated[
+    max_completion_tokens: Annotated[
         int | None,
         Field(
+            validation_alias=AliasChoices("max_completion_tokens", "max_tokens"),
             description="Maximum number of output tokens to generate per turn. If None, will generate until maximum context length or EOS token is hit.",
         ),
     ] = None
@@ -157,6 +159,13 @@ class SamplingConfig(BaseConfig):
             description="Extra body to pass with each request to the inference server. By default, it is set to an empty dictionary.",
         ),
     ] = {}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _deprecate_max_tokens(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "max_tokens" in data and "max_completion_tokens" not in data:
+            get_logger().warning("'max_tokens' is deprecated, use 'max_completion_tokens' instead.")
+        return data
 
 
 class EvalSamplingConfig(BaseConfig):
@@ -199,9 +208,10 @@ class EvalSamplingConfig(BaseConfig):
         ),
     ] = None
 
-    max_tokens: Annotated[
+    max_completion_tokens: Annotated[
         int | None,
         Field(
+            validation_alias=AliasChoices("max_completion_tokens", "max_tokens"),
             description="Maximum number of output tokens to generate per turn. If None, will generate until maximum context length or EOS token is hit.",
         ),
     ] = None
@@ -235,6 +245,13 @@ class EvalSamplingConfig(BaseConfig):
             description="Extra body to use for the OpenAI API. By default, it is set to an empty dictionary.",
         ),
     ] = {}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _deprecate_max_tokens(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "max_tokens" in data and "max_completion_tokens" not in data:
+            get_logger().warning("'max_tokens' is deprecated, use 'max_completion_tokens' instead.")
+        return data
 
 
 class EvalSaveHFConfig(BaseConfig):
@@ -283,10 +300,21 @@ class EnvConfig(BaseConfig):
         dict[str, Any],
         Field(
             description=(
-                "Extra kwargs passed to an env (e.g. seq_len, score_rollouts). This field is auto-populated with the seq_len, and score_rollouts for training envs on the orchestrator. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server."
+                "Extra kwargs passed to an env (e.g. seq_len, score_rollouts, max_total_completion_tokens). This field is auto-populated with the seq_len, and score_rollouts for training envs on the orchestrator and max_total_completion_tokens for all envs. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server."
             ),
         ),
     ] = {}
+    num_workers: Annotated[
+        int | Literal["auto"],
+        Field(
+            description=(
+                "Number of env server worker processes. "
+                "Set to 'auto' to scale based on the env's concurrency (1 worker per 256 concurrent rollouts). "
+                "When setting manually, we recommend sizing so that each worker handles at most 256 concurrent rollouts. "
+                "Only used when the orchestrator spawns the env server (i.e. address is None)."
+            ),
+        ),
+    ] = "auto"
     max_retries: Annotated[
         int,
         Field(
@@ -294,6 +322,15 @@ class EnvConfig(BaseConfig):
             description="Maximum number of times the environment will retry a failed rollout.",
         ),
     ] = 0
+    max_total_completion_tokens: Annotated[
+        int,
+        Field(
+            description=(
+                "Maximum total completion tokens across all turns in a multi-turn rollout. "
+                "Set to -1 (default) to disable. Auto-populated into extra_env_kwargs."
+            ),
+        ),
+    ] = -1
 
     @property
     def resolved_name(self) -> str:
@@ -305,6 +342,11 @@ class EnvConfig(BaseConfig):
             raise ValueError(
                 'Environment name "all" is reserved for global metric aggregation. Use a different name or id.'
             )
+        return self
+
+    @model_validator(mode="after")
+    def resolve_max_total_completion_tokens(self):
+        self.extra_env_kwargs["max_total_completion_tokens"] = self.max_total_completion_tokens
         return self
 
 
@@ -551,7 +593,10 @@ class DefaultAdvantageConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["default"] = "default"
-    length_weighted_mean: bool = False
+    length_shaping_alpha: Annotated[
+        float | None,
+        Field(description="Penalty coefficient for Group Relative Reward Rescaling (GR³). Recommended value: 0.33"),
+    ] = None
 
 
 class CustomAdvantageConfig(BaseModel):
@@ -642,6 +687,18 @@ class NCCLWeightBroadcastConfig(BaseModel):
     host: Annotated[str, Field(description="The host to use for the NCCL broadcast.")] = "localhost"
     port: Annotated[int, Field(description="The port to use for the NCCL broadcast.")] = 29501
     timeout: Annotated[int, Field(description="The timeout in seconds to use for the NCCL broadcast.")] = 1200
+    quantize_in_weight_transfer: Annotated[
+        bool,
+        Field(description="Use kernel-format FP8 quantized NCCL transfer for weight updates."),
+    ] = False
+
+    inference_world_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Total number of inference GPUs across all servers. Used by init_nccl_broadcast to compute per-server rank offsets.",
+        ),
+    ] = 1
 
 
 WeightBroadcastConfig: TypeAlias = Annotated[
@@ -660,6 +717,20 @@ class TeacherModelConfig(BaseConfig):
     model: Annotated[
         ModelConfig,
         Field(description="The model configuration for the teacher model."),
+    ] = ModelConfig()
+
+
+class TeacherRolloutModelConfig(BaseConfig):
+    """Configures an external teacher model used to generate rollout text."""
+
+    client: Annotated[
+        ClientConfig,
+        Field(description="The OAI client configuration for rollout generation."),
+    ] = ClientConfig()
+
+    model: Annotated[
+        ModelConfig,
+        Field(description="The model configuration for rollout generation."),
     ] = ModelConfig()
 
 
@@ -682,6 +753,17 @@ class OrchestratorConfig(BaseConfig):
             description="The teacher model configuration for computing teacher logprobs (e.g. for distillation). "
             "If provided, teacher logprobs will be computed using the specified model. "
             "If None, no teacher model will be used."
+        ),
+    ] = None
+
+    # External teacher rollout model configuration (optional)
+    teacher_rollout_model: Annotated[
+        TeacherRolloutModelConfig | None,
+        Field(
+            description=(
+                "Optional external teacher model used for rollout generation. "
+                "When set, rollouts are generated from this endpoint/model instead of the student inference server."
+            ),
         ),
     ] = None
 
@@ -943,6 +1025,13 @@ class OrchestratorConfig(BaseConfig):
                 "verification.enabled cannot be False when buffer.hard_threshold is set. "
                 "Hard threshold depends on rewards which are disabled when verification.enabled=False."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_length_shaping_requires_online_difficulty_filtering(self):
+        if isinstance(self.advantage, DefaultAdvantageConfig) and self.advantage.length_shaping_alpha is not None:
+            if not self.buffer.online_difficulty_filtering:
+                raise ValueError("Group Relative Reward (GR³) scaling requires online difficulty filtering")
         return self
 
     @model_validator(mode="after")

@@ -2,7 +2,7 @@ import warnings
 from typing import Optional, Union
 
 import torch
-import torch.nn.functional as F
+import torch.distributed as dist
 from torch import Tensor, nn
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
@@ -18,195 +18,43 @@ from prime_rl.trainer.models.glm_moe_dsa.converting_glm_moe_dsa import (
     convert_hf_layer_to_tt,
     convert_hf_to_tt_moe,
     convert_tt_layer_to_hf,
+    convert_tt_layer_to_vllm_kernel,
     convert_tt_to_hf_moe,
 )
+from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import GlmMoeDsaAttention, SparseMlaAttentionArgs
 from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput
 from prime_rl.trainer.models.layers.mlp import MLP, MLPConfig
 from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
-from prime_rl.trainer.models.layers.rms_norm import RMSNorm, RMSNormConfig
-from prime_rl.trainer.models.layers.rotary_emb import (
-    RotaryEmbedding,
-    RotaryEmbeddingConfig,
-    apply_rotary_pos_emb_interleave,
-)
-
-try:
-    from prime_rl.trainer.models.kernels.sparse_mla_bwd import sparse_mla_bwd
-    from prime_rl.trainer.models.kernels.sparse_mla_fwd import sparse_mla_fwd_interface
-except ImportError:
-    sparse_mla_fwd_interface = None  # type: ignore
-    sparse_mla_bwd = None  # type: ignore
-
-from prime_rl.trainer.models.kernels.fp8_indexer import fp8_indexer
+from prime_rl.trainer.models.layers.norms import RMSNorm, RMSNormConfig
+from prime_rl.trainer.models.layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig
+from prime_rl.utils.cp import gather_for_cp, shard_for_cp
 
 
-class _SparseMLA(torch.autograd.Function):
-    """Autograd wrapper for tilelang sparse MLA forward/backward kernels."""
-
-    @staticmethod
-    def forward(ctx, q, kv, indices, sm_scale):
-        out, lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=sm_scale)
-        ctx.save_for_backward(q, kv, out, indices, lse)
-        ctx.sm_scale = sm_scale
-        return out
-
-    @staticmethod
-    def backward(ctx, do):
-        q, kv, out, indices, lse = ctx.saved_tensors
-        dq, dkv = sparse_mla_bwd(q, kv, out, do.contiguous(), indices, lse, sm_scale=ctx.sm_scale)
-        return dq, dkv, None, None
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor):
-        return F.layer_norm(x.float(), (self.dim,), self.weight.float(), self.bias.float(), self.eps).type_as(x)
-
-
-class Indexer(nn.Module):
-    def __init__(self, config: GlmMoeDsaConfig):
-        super().__init__()
-        if config.q_lora_rank is None:
-            raise ValueError("Sparse indexer requires q_lora_rank to be set")
-
-        self.n_head = config.index_n_heads
-        self.head_dim = config.index_head_dim
-        self.rope_dim = config.qk_rope_head_dim
-        self.wq_b = nn.Linear(config.q_lora_rank, self.n_head * self.head_dim, bias=False)
-        self.wk = nn.Linear(config.hidden_size, self.head_dim, bias=config.attention_bias)
-        self.k_norm = LayerNorm(dim=self.head_dim, eps=1e-6)
-        self.weights_proj = nn.Linear(config.hidden_size, self.n_head, bias=False)
-        self.weight_scale = (self.head_dim**-0.5) * (self.n_head**-0.5)
-
-    @torch.no_grad()
-    def compute_sparse_indices(
-        self,
-        hidden_states: torch.Tensor,
-        q_latent: torch.Tensor,
-        ks: torch.Tensor,
-        ke: torch.Tensor,
-        index_topk: int,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        total_tokens = hidden_states.shape[1]
-        assert index_topk % 64 == 0, f"index_topk must be divisible by 64 (block_I), got {index_topk}"
-
-        q_idx = self.wq_b(q_latent[0]).view(total_tokens, self.n_head, self.head_dim)
-        k_idx = self.k_norm(self.wk(hidden_states[0]))
-        w = self.weights_proj(hidden_states[0])
-
-        q_pe = q_idx[..., : self.rope_dim]
-        q_nope = q_idx[..., self.rope_dim :]
-        k_pe = k_idx[..., : self.rope_dim]
-        k_nope = k_idx[..., self.rope_dim :]
-
-        cos, sin = position_embeddings
-        q_pe = q_pe.unsqueeze(0).transpose(1, 2)
-        k_pe = k_pe.unsqueeze(0).unsqueeze(1)
-        q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
-        q_pe = q_pe.transpose(1, 2).squeeze(0)
-        k_pe = k_pe.squeeze(1).squeeze(0)
-
-        q_idx = torch.cat([q_pe, q_nope], dim=-1)
-        k_idx = torch.cat([k_pe, k_nope], dim=-1)
-
-        indices = fp8_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale)
-        return indices.view(1, total_tokens, 1, index_topk)
-
-
-class GlmMoeDsaAttention(nn.Module):
-    def __init__(self, config: GlmMoeDsaConfig):
-        super().__init__()
-        self.config = config
-        self.num_heads = config.num_attention_heads
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_head_dim = config.qk_head_dim
-        self.v_head_dim = config.v_head_dim
-
-        self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-        self.q_a_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.q_lora_rank, eps=config.rms_norm_eps))
-        self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
-
-        self.kv_a_proj_with_mqa = nn.Linear(
-            config.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=config.attention_bias,
-        )
-        self.kv_a_layernorm = RMSNorm(RMSNormConfig(hidden_size=self.kv_lora_rank, eps=config.rms_norm_eps))
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-        )
-
-        self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=config.attention_bias)
-        self.indexer = Indexer(config)
-        self.scaling = self.qk_head_dim ** (-0.5)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        ks: torch.Tensor | None = None,
-        ke: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        batch_size, total_tokens, _ = hidden_states.shape
-
-        q_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
-        q_full = self.q_b_proj(q_latent).view(batch_size, total_tokens, self.num_heads, self.qk_head_dim)
-        q_nope, q_rope = q_full.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_compressed, k_rope = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_compressed_normed = self.kv_a_layernorm(k_compressed)
-
-        q_rope_r = q_rope.transpose(1, 2)
-        k_rope_r = k_rope.unsqueeze(1)
-        cos, sin = position_embeddings
-        q_rope_r, k_rope_r = apply_rotary_pos_emb_interleave(q_rope_r, k_rope_r, cos, sin)
-        q_rope = q_rope_r.transpose(1, 2)
-        k_rope = k_rope_r.squeeze(1)
-
-        indices = self.indexer.compute_sparse_indices(
-            hidden_states, q_latent, ks, ke, self.config.index_topk, position_embeddings
-        )
-
-        # KV absorption
-        kv_b_w = self.kv_b_proj.weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
-        w_k_nope = kv_b_w[:, : self.qk_nope_head_dim, :]
-        w_v = kv_b_w[:, self.qk_nope_head_dim :, :]
-
-        q_absorbed = torch.einsum("bshd,hdk->bshk", q_nope, w_k_nope)
-
-        sparse_q = torch.cat([q_absorbed, q_rope], dim=-1)
-        sparse_kv = torch.cat([k_compressed_normed, k_rope], dim=-1).unsqueeze(2)
-
-        # Sentinel zero-token so padded indices (= total_tokens) are in-bounds
-        sentinel = torch.zeros(batch_size, 1, 1, sparse_kv.shape[-1], dtype=sparse_kv.dtype, device=sparse_kv.device)
-        sparse_kv = torch.cat([sparse_kv, sentinel], dim=1)
-
-        out = _SparseMLA.apply(sparse_q, sparse_kv, indices, self.scaling)
-
-        # Un-absorb
-        out = torch.einsum("bshk,hdk->bshd", out, w_v)
-
-        out = out.reshape(batch_size, total_tokens, -1)
-        return self.o_proj(out), None
+def _sparse_mla_attention_args(config: GlmMoeDsaConfig) -> SparseMlaAttentionArgs:
+    if config.q_lora_rank is None:
+        raise ValueError("Sparse MLA attention requires q_lora_rank to be set")
+    return SparseMlaAttentionArgs(
+        hidden_size=config.hidden_size,
+        num_attention_heads=config.num_attention_heads,
+        kv_lora_rank=config.kv_lora_rank,
+        q_lora_rank=config.q_lora_rank,
+        qk_rope_head_dim=config.qk_rope_head_dim,
+        qk_nope_head_dim=config.qk_nope_head_dim,
+        qk_head_dim=config.qk_head_dim,
+        v_head_dim=config.v_head_dim,
+        attention_bias=config.attention_bias,
+        rms_norm_eps=config.rms_norm_eps,
+        index_n_heads=config.index_n_heads,
+        index_head_dim=config.index_head_dim,
+        index_topk=config.index_topk,
+    )
 
 
 class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = GlmMoeDsaAttention(config)
+        self.self_attn = GlmMoeDsaAttention(_sparse_mla_attention_args(config))
 
         moe_args = MoEArgs(
             num_experts=config.n_routed_experts,
@@ -234,6 +82,27 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attention_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
 
+    def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
+        self._cp_group = cp_group
+        self._cp_rank = cp_rank
+        self._cp_world_size = cp_world_size
+
+    @property
+    def cp_enabled(self) -> bool:
+        return hasattr(self, "_cp_group") and hasattr(self, "_cp_rank") and hasattr(self, "_cp_world_size")
+
+    def shard_to_cp(self, t: torch.Tensor) -> torch.Tensor:
+        if not self.cp_enabled:
+            return t
+
+        return shard_for_cp(t, self._cp_rank, self._cp_world_size)
+
+    def gather_for_cp(self, t: torch.Tensor) -> torch.Tensor:
+        if not self.cp_enabled:
+            return t
+
+        return gather_for_cp(t, self._cp_group)
+
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
@@ -245,12 +114,14 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.gather_for_cp(hidden_states)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             ks=ks,
             ke=ke,
         )
+        hidden_states = self.shard_to_cp(hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -307,6 +178,12 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
         convert_hf_layer_to_tt(state_dict, layer_idx)
         return state_dict
 
+    @classmethod
+    def convert_layer_to_vllm_kernel(
+        cls, state_dict: dict[str, Tensor], layer_idx: int, quantize_fp8: bool = False
+    ) -> dict[str, Tensor]:
+        return convert_tt_layer_to_vllm_kernel(state_dict, layer_idx, quantize_fp8=quantize_fp8)
+
 
 @auto_docstring
 class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
@@ -334,6 +211,23 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
         self.post_init()
 
+    def _context_parallel_state(self) -> tuple[dist.ProcessGroup | None, int, int]:
+        if len(self.layers) == 0:
+            return None, 0, 1
+
+        layer = self.layers[0]
+        return getattr(layer, "_cp_group", None), getattr(layer, "_cp_rank", 0), getattr(layer, "_cp_world_size", 1)
+
+    def _gather_position_ids_for_cp(
+        self,
+        position_ids: torch.LongTensor,
+        cp_group: dist.ProcessGroup,
+        cp_world_size: int,
+    ) -> torch.LongTensor:
+        gathered_position_ids = [torch.empty_like(position_ids) for _ in range(cp_world_size)]
+        dist.all_gather(gathered_position_ids, position_ids.contiguous(), group=cp_group)
+        return torch.cat(gathered_position_ids, dim=1)
+
     @auto_docstring
     def forward(
         self,
@@ -352,13 +246,19 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
-        flat_position_ids = position_ids.view(-1)
+        cp_group, _, cp_world_size = self._context_parallel_state()
+        if cp_group is not None and cp_world_size > 1:
+            position_ids_for_attn = self._gather_position_ids_for_cp(position_ids, cp_group, cp_world_size)
+        else:
+            position_ids_for_attn = position_ids
+
+        flat_position_ids = position_ids_for_attn.view(-1)
         S = flat_position_ids.shape[0]
         ks = torch.arange(S, dtype=torch.int32, device=flat_position_ids.device) - flat_position_ids.to(torch.int32)
         ke = torch.arange(1, S + 1, dtype=torch.int32, device=flat_position_ids.device)
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids_for_attn)
 
         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             routed_experts_layer = routed_experts[:, :, layer_idx, :] if routed_experts is not None else None

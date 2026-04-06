@@ -10,6 +10,7 @@ def transformers_v5_compat():
         Qwen3VLMoeTextConfig.tie_word_embeddings = False
 
     _patch_qwen35_lora()
+    monkey_patch_dp_engine_core_pause_resume_deadlock()
 
 
 def _patch_qwen35_lora():
@@ -63,41 +64,8 @@ def _patch_qwen35_lora():
     MergedColumnParallelLinearWithShardedLoRA.slice_lora_a = slice_lora_a
 
 
-# Monkeypatch PrometheusStatLogger to avoid NotImplementedError for LoRA in DP mode
-def monkey_patch_prometheus_stat_logger_for_lora_in_dp_mode():
-    from vllm.v1.metrics import loggers as vllm_metrics_loggers
-
-    _original_prometheus_stat_logger_init = vllm_metrics_loggers.PrometheusStatLogger.__init__
-
-    def _patched_prometheus_stat_logger_init(self, vllm_config, engine_indexes=None):
-        """Patched init that temporarily disables lora_config to skip the DP mode check."""
-        original_lora_config = vllm_config.lora_config
-        vllm_config.lora_config = None
-        try:
-            _original_prometheus_stat_logger_init(self, vllm_config, engine_indexes)
-        finally:
-            vllm_config.lora_config = original_lora_config
-        # Re-initialize LoRA metrics if needed (after the DP check is bypassed)
-        if original_lora_config is not None:
-            self.labelname_max_lora = "max_lora"
-            self.labelname_waiting_lora_adapters = "waiting_lora_adapters"
-            self.labelname_running_lora_adapters = "running_lora_adapters"
-            self.max_lora = original_lora_config.max_loras
-            self.gauge_lora_info = vllm_metrics_loggers.PrometheusStatLogger._gauge_cls(
-                name="vllm:lora_requests_info",
-                documentation="Running stats on lora requests.",
-                multiprocess_mode="sum",
-                labelnames=[
-                    self.labelname_max_lora,
-                    self.labelname_waiting_lora_adapters,
-                    self.labelname_running_lora_adapters,
-                ],
-            )
-
-    vllm_metrics_loggers.PrometheusStatLogger.__init__ = _patched_prometheus_stat_logger_init
-
-
 # Monkeypatch LoadLoRAAdapter to allow loading the same adapter multiple times
+# TODO: may be removable if we pass load_inplace=True (supported since vLLM 0.18, PR #31326)
 def monkey_patch_load_lora_adapter():
     from http import HTTPStatus
 
@@ -152,6 +120,7 @@ def monkey_patch_load_lora_adapter():
 
 
 # Monkeypatch LRUCacheWorkerLoRAManager to allow loading adapter inplace without doing it every request
+# TODO: may be removable if we pass load_inplace=True (supported since vLLM 0.18, PR #31326)
 def monkey_patch_LRUCacheWorkerLoRAManager():
     from vllm.lora.worker_manager import LoRARequest, LRUCacheLoRAModelManager, LRUCacheWorkerLoRAManager
 
@@ -277,109 +246,6 @@ def monkey_patch_tokenize_params_validation():
     TokenizeParams.get_encode_kwargs = _patched_get_encode_kwargs
 
 
-def monkey_patch_hermes_tool_parser_thread_safety():
-    """Patch Hermes2ProToolParser to cache tokenizer encode/decode results.
-
-    The original __init__ calls tokenizer.encode() and tokenizer.decode() on
-    every instantiation. Under concurrent load, the shared HuggingFace tokenizer's
-    Rust backend panics with ``RuntimeError: Already borrowed`` because multiple
-    threads mutably borrow the same internal state simultaneously.
-
-    Fix: run the first __init__ (which calls encode/decode) under a lock, cache
-    the results, and reuse them for all subsequent instantiations without ever
-    touching the tokenizer again.
-    """
-    import threading
-
-    import regex as re
-    from vllm.tool_parsers.abstract_tool_parser import ToolParser
-    from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
-
-    _original_init = Hermes2ProToolParser.__init__
-    _cache: dict[int, dict] = {}
-    _lock = threading.Lock()
-
-    def _patched_init(self, tokenizer):
-        from vllm.tokenizers.mistral import MistralTokenizer
-
-        # Resolve the actual tokenizer that __init__ will use for encode/decode
-        actual_tokenizer = tokenizer.tokenizer if isinstance(tokenizer, MistralTokenizer) else tokenizer
-        key = id(actual_tokenizer)
-
-        if key in _cache:
-            # Fast path: skip encode/decode entirely, set up instance from cache
-            ToolParser.__init__(self, tokenizer)
-            if isinstance(tokenizer, MistralTokenizer):
-                self.model_tokenizer = tokenizer.tokenizer
-            self.current_tool_name_sent = False
-            self.prev_tool_call_arr = []
-            self.current_tool_id = -1
-            self.streamed_args_for_tool = []
-            self.tool_call_start_token = "<tool_call>"
-            self.tool_call_end_token = "</tool_call>"
-            self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL)
-            self.scratch_pad_regex = re.compile(r"<scratch_pad>(.*?)</scratch_pad>", re.DOTALL)
-            cached = _cache[key]
-            self.tool_call_start_token_ids = cached["start_ids"]
-            self.tool_call_end_token_ids = cached["end_ids"]
-            self.tool_call_start_token_array = cached["start_array"]
-            self.tool_call_end_token_array = cached["end_array"]
-            self.buffered_delta_text = ""
-            return
-
-        # Slow path: first instantiation for this tokenizer, run under lock
-        with _lock:
-            if key in _cache:
-                # Another thread populated it while we waited
-                _patched_init(self, tokenizer)
-                return
-            _original_init(self, tokenizer)
-            _cache[key] = {
-                "start_ids": self.tool_call_start_token_ids,
-                "end_ids": self.tool_call_end_token_ids,
-                "start_array": self.tool_call_start_token_array,
-                "end_array": self.tool_call_end_token_array,
-            }
-
-    Hermes2ProToolParser.__init__ = _patched_init
-
-
-def monkey_patch_tokenizer_thread_safety():
-    """Patch HuggingFace tokenizer to make _encode_plus thread-safe.
-
-    Under concurrent request load, vLLM's API server calls _encode_plus from
-    multiple async handlers simultaneously. _encode_plus mutates the Rust
-    tokenizer's internal state via set_truncation_and_padding (enable_truncation/
-    enable_padding) and encode_special_tokens. The Rust backend uses RefCell-style
-    borrow tracking (PyO3), and concurrent mutable borrows cause it to panic
-    with ``RuntimeError: Already borrowed``.
-
-    Fix: wrap the entire _encode_plus method in a per-tokenizer threading lock
-    so that state mutation and the subsequent encode call are atomic.
-    """
-    import threading
-
-    from transformers import PreTrainedTokenizerFast
-
-    _original_encode_plus = PreTrainedTokenizerFast._encode_plus
-    _locks: dict[int, threading.Lock] = {}
-    _meta_lock = threading.Lock()
-
-    def _get_lock(tokenizer_id: int) -> threading.Lock:
-        if tokenizer_id not in _locks:
-            with _meta_lock:
-                if tokenizer_id not in _locks:
-                    _locks[tokenizer_id] = threading.Lock()
-        return _locks[tokenizer_id]
-
-    def _patched_encode_plus(self, *args, **kwargs):
-        lock = _get_lock(id(self._tokenizer))
-        with lock:
-            return _original_encode_plus(self, *args, **kwargs)
-
-    PreTrainedTokenizerFast._encode_plus = _patched_encode_plus
-
-
 def monkey_patch_minimax_m2_for_lora():
     """Patch vLLM's MiniMaxM2 model for LoRA compatibility.
 
@@ -453,3 +319,334 @@ def monkey_patch_minimax_m2_for_lora():
             ".up_proj.": ".w3.",
         },
     )
+
+
+def monkey_patch_harmony_stop_token_propagation():
+    """Fix: vLLM doesn't merge harmony stop tokens into per-request SamplingParams.
+
+    The harmony mode sets stop_token_ids (including <|call|> and <|return|>) in
+    default_sampling_params at server init, but ChatCompletionRequest.to_sampling_params()
+    ignores them, using only self.stop_token_ids (which defaults to []).
+
+    Upstream: https://github.com/vllm-project/vllm/issues/22519
+    """
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+    _original_to_sampling_params = ChatCompletionRequest.to_sampling_params
+
+    def _patched_to_sampling_params(self, max_tokens, default_sampling_params):
+        params = _original_to_sampling_params(self, max_tokens, default_sampling_params)
+        # Merge harmony stop tokens from default_sampling_params
+        default_stop_ids = default_sampling_params.get("stop_token_ids", [])
+        if default_stop_ids:
+            existing = set(params.stop_token_ids or [])
+            merged = list(existing | set(default_stop_ids))
+            params.stop_token_ids = merged
+        return params
+
+    ChatCompletionRequest.to_sampling_params = _patched_to_sampling_params
+
+
+def monkey_patch_fused_moe_lora_dp():
+    """Fix: LoRA + MoE + DP>1 produces corrupted output in vLLM 0.17.0.
+
+    Two bugs:
+    1. LoRA injection sets supports_internal_mk=True (via moe_kernel not None),
+       causing the MoE runner to skip DP dispatch/combine. But the LoRA kernel
+       uses NoDPEP and doesn't handle DP internally.
+    2. LoRA decorators capture full-batch tensors but fire per-chunk inside the
+       kernel's chunk loop. At DP>=3, dispatched batch > CHUNK_SIZE causes
+       shape mismatches.
+
+    Fix: Replace _inject_lora_into_fused_moe with a version that:
+    (a) sets moe_kernel=None so the runner correctly dispatches
+    (b) makes decorators chunk-aware by tracking chunk offsets
+
+    Upstream: https://github.com/vllm-project/vllm/issues/23244
+    """
+    import types
+
+    from vllm import envs
+    from vllm.distributed.utils import divide
+    from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+    from vllm.model_executor.layers.fused_moe.config import _get_config_dtype_str
+    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import MarlinExperts
+    from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
+    from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import FusedMoEModularMethod
+    from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import UnfusedOAITritonExperts
+    from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import MoEPrepareAndFinalizeNoDPEPModular
+
+    def _fixed_inject(self):
+        moe_state_dict = {}
+        top_k = self.base_layer.top_k
+
+        self.base_layer.ensure_moe_quant_config_init()
+        quant_config = self.base_layer.quant_method.moe_quant_config
+
+        if getattr(self.base_layer.quant_method, "supports_internal_mk", False):
+            m_fused_moe_fn = self.base_layer.quant_method.moe_kernel
+            m_fused_moe_fn.shared_experts = None
+        else:
+            prepare_finalize = MoEPrepareAndFinalizeNoDPEPModular()
+            m_fused_moe_fn = FusedMoEKernel(
+                prepare_finalize,
+                self.base_layer.quant_method.select_gemm_impl(prepare_finalize, self.base_layer),
+            )
+
+        if quant_config.use_mxfp4_w4a16:
+            assert isinstance(m_fused_moe_fn.impl.fused_experts, (MarlinExperts, UnfusedOAITritonExperts))
+        else:
+            assert isinstance(m_fused_moe_fn.impl.fused_experts, TritonExperts)
+
+        # --- Decorators (chunk-aware) ---
+
+        def fwd_decorator(layer, func):
+            def wrapper(*args, **kwargs):
+                moe_state_dict["hidden_states"] = kwargs["hidden_states"]
+                moe_state_dict["topk_ids"] = kwargs["topk_ids"]
+                moe_state_dict["topk_weights"] = kwargs["topk_weights"]
+                moe_state_dict["expert_map"] = kwargs["expert_map"]
+                moe_state_dict["apply_router_weight_on_input"] = kwargs["apply_router_weight_on_input"]
+                moe_state_dict["_chunk_offset"] = 0
+                return func(*args, **kwargs)
+
+            return wrapper
+
+        def act_decorator(layer, func):
+            def wrapper(*args, **kwargs):
+                _, output, input = args
+                chunk_M = input.view(-1, top_k, input.shape[-1]).shape[0]
+                chunk_offset = moe_state_dict.get("_chunk_offset", 0)
+                hidden_states = moe_state_dict["hidden_states"][chunk_offset : chunk_offset + chunk_M]
+                topk_weights = moe_state_dict["topk_weights"][chunk_offset : chunk_offset + chunk_M]
+                curr_topk_ids = moe_state_dict["topk_ids"][chunk_offset : chunk_offset + chunk_M]
+                expert_map = moe_state_dict["expert_map"]
+                config_dtype = _get_config_dtype_str(
+                    dtype=hidden_states.dtype, use_fp8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False
+                )
+                num_tokens = hidden_states.size(0)
+                M = min(num_tokens, envs.VLLM_FUSED_MOE_CHUNK_SIZE)
+                max_lora_rank = self.w13_lora_a_stacked[0].shape[-2]
+                shrink_config, expand_config = self._get_lora_moe_configs(
+                    op_prefix="w13",
+                    num_loras=self.max_loras,
+                    rank=max_lora_rank,
+                    num_slices=self._w13_slices,
+                    M=M,
+                    layer=layer,
+                    top_k=top_k,
+                    config_dtype=config_dtype,
+                )
+                SPARSITY_FACTOR = 8
+                naive_block_assignment = (
+                    expert_map is None
+                    and num_tokens * top_k * SPARSITY_FACTOR <= self.base_layer.local_num_experts * self.max_loras
+                )
+                token_lora_mapping, sorted_token_ids_lora, expert_ids_lora, num_tokens_post_padded_lora = (
+                    self.punica_wrapper.moe_lora_align_block_size(
+                        curr_topk_ids,
+                        num_tokens,
+                        shrink_config["BLOCK_SIZE_M"],
+                        self.base_layer.local_num_experts,
+                        self.max_loras,
+                        self.adapter_enabled,
+                        expert_map,
+                        naive_block_assignment=naive_block_assignment,
+                    )
+                )
+                moe_state_dict["sorted_token_ids_lora"] = sorted_token_ids_lora
+                moe_state_dict["expert_ids_lora"] = expert_ids_lora
+                moe_state_dict["num_tokens_post_padded_lora"] = num_tokens_post_padded_lora
+                moe_state_dict["token_lora_mapping"] = token_lora_mapping
+                if sorted_token_ids_lora is not None:
+                    expert_ids_lora = expert_ids_lora.view(self.max_loras, -1)
+                    sorted_token_ids_lora = sorted_token_ids_lora.view(self.max_loras, -1)
+                self.punica_wrapper.add_lora_fused_moe(
+                    input.view(-1, top_k, input.shape[-1]),
+                    hidden_states,
+                    self.w13_lora_a_stacked,
+                    self.w13_lora_b_stacked,
+                    topk_weights,
+                    sorted_token_ids_lora,
+                    expert_ids_lora,
+                    num_tokens_post_padded_lora,
+                    max_lora_rank,
+                    top_k,
+                    shrink_config,
+                    expand_config,
+                    self.adapter_enabled,
+                    fully_sharded=self.fully_sharded,
+                    token_lora_mapping=token_lora_mapping,
+                )
+                result = func(*args, **kwargs)
+                moe_state_dict["intermediate_cache2"] = output
+                moe_state_dict["_chunk_M"] = chunk_M
+                return result
+
+            return wrapper
+
+        def moe_sum_decorator(layer, func):
+            def wrapper(*args, **kwargs):
+                chunk_offset = moe_state_dict.get("_chunk_offset", 0)
+                chunk_M = moe_state_dict.get("_chunk_M", moe_state_dict["hidden_states"].size(0))
+                hidden_states = moe_state_dict["hidden_states"][chunk_offset : chunk_offset + chunk_M]
+                topk_weights = moe_state_dict["topk_weights"][chunk_offset : chunk_offset + chunk_M]
+                config_dtype = _get_config_dtype_str(
+                    dtype=hidden_states.dtype, use_fp8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False
+                )
+                num_tokens = hidden_states.size(0)
+                M = min(num_tokens, envs.VLLM_FUSED_MOE_CHUNK_SIZE)
+                max_lora_rank = self.w2_lora_a_stacked[0].shape[-2]
+                shrink_config, expand_config = self._get_lora_moe_configs(
+                    op_prefix="w2",
+                    num_loras=self.max_loras,
+                    rank=max_lora_rank,
+                    num_slices=1,
+                    M=M,
+                    layer=layer,
+                    top_k=top_k,
+                    config_dtype=config_dtype,
+                )
+                sorted_token_ids_lora = moe_state_dict["sorted_token_ids_lora"]
+                expert_ids_lora = moe_state_dict["expert_ids_lora"]
+                num_tokens_post_padded_lora = moe_state_dict["num_tokens_post_padded_lora"]
+                token_lora_mapping = moe_state_dict.get("token_lora_mapping")
+                if sorted_token_ids_lora is not None:
+                    expert_ids_lora = expert_ids_lora.view(self.max_loras, -1)
+                    sorted_token_ids_lora = sorted_token_ids_lora.view(self.max_loras, -1)
+                intermediate_cache2 = moe_state_dict["intermediate_cache2"]
+                intermediate_cache3 = args[0]
+                shard_size_w2 = divide(self.base_layer.hidden_size, self.tp_size)
+                self.punica_wrapper.add_lora_fused_moe(
+                    intermediate_cache3,
+                    intermediate_cache2,
+                    self.w2_lora_a_stacked,
+                    self.w2_lora_b_stacked,
+                    topk_weights,
+                    sorted_token_ids_lora,
+                    expert_ids_lora,
+                    num_tokens_post_padded_lora,
+                    max_lora_rank,
+                    top_k,
+                    shrink_config,
+                    expand_config,
+                    self.adapter_enabled,
+                    True,
+                    fully_sharded=self.fully_sharded,
+                    offset=shard_size_w2 * self.tp_rank if self.fully_sharded else 0,
+                    token_lora_mapping=token_lora_mapping,
+                )
+                result = func(*args, **kwargs)
+                moe_state_dict["_chunk_offset"] = chunk_offset + chunk_M
+                return result
+
+            return wrapper
+
+        # --- Install decorators and replace quant method ---
+
+        fused_experts = m_fused_moe_fn.impl.fused_experts
+        m_fused_moe_fn.apply = fwd_decorator(self.base_layer, m_fused_moe_fn.apply)
+        fused_experts.activation = act_decorator(self.base_layer, fused_experts.activation)
+        fused_experts.moe_sum = moe_sum_decorator(self.base_layer, fused_experts.moe_sum)
+
+        new_method = FusedMoEModularMethod(self.base_layer.quant_method, m_fused_moe_fn)
+
+        # Bug 1 fix: NoDPEP kernel makes supports_internal_mk=True, causing the
+        # runner to skip DP dispatch/combine. Set moe_kernel=None and patch apply().
+        if isinstance(m_fused_moe_fn.prepare_finalize, MoEPrepareAndFinalizeNoDPEPModular):
+            saved_kernel = new_method.moe_kernel
+            saved_disable_expert_map = new_method.disable_expert_map
+            new_method.moe_kernel = None
+
+            def _apply_with_saved_kernel(self, layer, x, topk_weights, topk_ids, shared_experts_input):
+                return saved_kernel.apply(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    expert_map=None if saved_disable_expert_map else layer.expert_map,
+                    shared_experts_input=shared_experts_input,
+                )
+
+            new_method.apply = types.MethodType(_apply_with_saved_kernel, new_method)
+
+        self.base_layer._replace_quant_method(new_method)
+
+    FusedMoEWithLoRA._inject_lora_into_fused_moe = _fixed_inject
+
+
+def monkey_patch_dp_engine_core_pause_resume_deadlock():
+    """Fix DP pause/resume deadlocks around weight updates.
+
+    Bug 1 (job 3756): while paused, START_DP_WAVE can wake idle ranks into the
+    DP loop. Those ranks then run dummy batches and hit DP collectives while
+    other ranks are still in NCCL weight transfer.
+
+    Bug 2 (jobs 3769/3771): resume ties the DP running state to local
+    unfinished requests, but the DP wave state is global. Ranks with no local
+    work still need to re-enter the loop so they can participate in the same
+    DP collectives as ranks that are resuming remote-KV or decode work.
+
+    Fix:
+    - ignore START_DP_WAVE wakeups while paused
+    - on resume, wake every DP rank and force an immediate global unfinished
+      sync instead of waiting for the normal 32-step cadence
+
+    This keeps the upstream pause-side fix from
+    https://github.com/vllm-project/vllm/pull/37024 and extends it with the
+    resume-side wave-state fix.
+    """
+    from vllm.config import ParallelConfig
+    from vllm.v1.core.sched.interface import PauseState
+    from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
+    from vllm.v1.request import Request
+
+    _base_add_request = EngineCore.add_request
+    _base_handle_client_request = EngineCoreProc._handle_client_request
+    _base_resume_scheduler = DPEngineCoreProc.resume_scheduler
+
+    def _patched_add_request(self, request: Request, request_wave: int = 0):
+        _base_add_request(self, request, request_wave)
+        if self.has_coordinator and request_wave != self.current_wave:
+            if request_wave > self.current_wave:
+                self.current_wave = request_wave
+            elif not self.engines_running and self.scheduler.pause_state == PauseState.UNPAUSED:
+                self.engines_running = True
+                self.output_queue.put_nowait((-1, EngineCoreOutputs(start_wave=self.current_wave)))
+
+    def _patched_handle_client_request(self, request_type, request):
+        if request_type == EngineCoreRequestType.START_DP_WAVE:
+            new_wave, exclude_eng_index = request
+            if exclude_eng_index != self.engine_index and new_wave >= self.current_wave:
+                self.current_wave = new_wave
+                if not self.engines_running and self.scheduler.pause_state == PauseState.UNPAUSED:
+                    self.engines_running = True
+        else:
+            _base_handle_client_request(self, request_type, request)
+
+    def _patched_resume_scheduler(self):
+        was_paused = self.scheduler.pause_state != PauseState.UNPAUSED
+        _base_resume_scheduler(self)
+        if was_paused:
+            self.engines_running = True
+            self._force_dp_running_state_sync = True
+
+    def _patched_has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+        self.step_counter += 1
+        if getattr(self, "_force_dp_running_state_sync", False):
+            self._force_dp_running_state_sync = False
+            return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        if self.step_counter % 32 != 0:
+            return True
+        return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+
+    DPEngineCoreProc.add_request = _patched_add_request
+    DPEngineCoreProc._handle_client_request = _patched_handle_client_request
+    DPEngineCoreProc.resume_scheduler = _patched_resume_scheduler
+    DPEngineCoreProc._has_global_unfinished_reqs = _patched_has_global_unfinished_reqs

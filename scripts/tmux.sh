@@ -49,54 +49,61 @@ if [[ ${#POSITIONAL[@]} -ge 2 ]]; then
   OUTPUT_DIR="${POSITIONAL[1]}"
 fi
 
+LOG_DIR="${OUTPUT_DIR}/logs"
+
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Attaching to tmux session: $SESSION_NAME"
   exec tmux attach-session -t "$SESSION_NAME"
-else
-  echo "Creating new tmux session: $SESSION_NAME"
-
-  # Start new tmux session with first window
-  tmux new-session -d -s "$SESSION_NAME" -n "RL"
-
-  # Window 1: RL - 3 vertical panes
-  tmux split-window -v -t "$SESSION_NAME:RL.0"
-  tmux split-window -v -t "$SESSION_NAME:RL.1"
-  tmux select-layout -t "$SESSION_NAME:RL" even-vertical
-
-  # Pane titles
-  tmux select-pane -t "$SESSION_NAME:RL.0" -T "Trainer"
-  tmux select-pane -t "$SESSION_NAME:RL.1" -T "Orchestrator"
-  tmux select-pane -t "$SESSION_NAME:RL.2" -T "Inference"
-
-  # Logs: Orchestrator
-  tmux send-keys -t "$SESSION_NAME:RL.1" \
-    "echo \"Following orchestrator.stdout (tail -F; waits for rotate/create)...\"; tail -F \"${OUTPUT_DIR}/logs/orchestrator.stdout\" 2>/dev/null" \
-    C-m
-
-  # Logs: Inference
-  tmux send-keys -t "$SESSION_NAME:RL.2" \
-    "echo \"Following inference.stdout (tail -F; waits for rotate/create)...\"; tail -F \"${OUTPUT_DIR}/logs/inference.stdout\" 2>/dev/null" \
-    C-m
-
-  # Window 2: Monitor
-  tmux new-window -t "$SESSION_NAME" -n "Monitor"
-  tmux split-window -h -t "$SESSION_NAME:Monitor"
-  tmux select-layout -t "$SESSION_NAME:Monitor" even-horizontal
-
-  tmux select-pane -t "$SESSION_NAME:Monitor.0" -T "GPU"
-  tmux send-keys -t "$SESSION_NAME:Monitor.0" "nvtop" C-m
-
-  tmux select-pane -t "$SESSION_NAME:Monitor.1" -T "CPU"
-  tmux send-keys -t "$SESSION_NAME:Monitor.1" "htop" C-m
-
-  # Pane title styling
-  tmux set-option -t "$SESSION_NAME" -g pane-border-status top
-  tmux set-option -t "$SESSION_NAME" -g pane-border-format " #{pane_title} "
-  tmux set-window-option -t "$SESSION_NAME:RL" pane-border-status top
-  tmux set-window-option -t "$SESSION_NAME:Monitor" pane-border-status top
-
-  # Focus trainer pane and attach
-  tmux select-window -t "$SESSION_NAME:RL"
-  tmux select-pane -t "$SESSION_NAME:RL.0"
-  exec tmux attach-session -t "$SESSION_NAME"
 fi
+
+echo "Creating new tmux session: $SESSION_NAME"
+
+# Window 0: Launcher - empty shell
+tmux new-session -d -s "$SESSION_NAME" -n "Launcher"
+
+# Window 1: Logs - 4 vertical panes
+tmux new-window -t "$SESSION_NAME" -n "Logs"
+
+tmux split-window -v -t "$SESSION_NAME:Logs.0"
+tmux split-window -v -t "$SESSION_NAME:Logs.1"
+tmux split-window -v -t "$SESSION_NAME:Logs.2"
+tmux select-layout -t "$SESSION_NAME:Logs" even-vertical
+
+tmux select-pane -t "$SESSION_NAME:Logs.0" -T "Trainer"
+tmux select-pane -t "$SESSION_NAME:Logs.1" -T "Orchestrator"
+tmux select-pane -t "$SESSION_NAME:Logs.2" -T "Envs"
+tmux select-pane -t "$SESSION_NAME:Logs.3" -T "Inference"
+
+tmux send-keys -t "$SESSION_NAME:Logs.0" \
+  "tail -F ${LOG_DIR}/trainer.log 2>/dev/null" C-m
+
+tmux send-keys -t "$SESSION_NAME:Logs.1" \
+  "tail -F ${LOG_DIR}/orchestrator.log 2>/dev/null" C-m
+
+tmux send-keys -t "$SESSION_NAME:Logs.2" \
+  "tail -F ${LOG_DIR}/envs/*/*/*.log 2>/dev/null" C-m
+
+tmux send-keys -t "$SESSION_NAME:Logs.3" \
+  "tail -F ${LOG_DIR}/inference.log 2>/dev/null" C-m
+
+# Window 2: Claude Code with log context
+tmux new-window -t "$SESSION_NAME" -n "Claude"
+tmux send-keys -t "$SESSION_NAME:Claude" \
+  "claude --permission-mode auto --append-system-prompt 'You are monitoring a prime-rl training run. The output directory is ${OUTPUT_DIR}. Log paths:
+  Trainer:        ${LOG_DIR}/trainer.log
+  All nodes:      ${LOG_DIR}/trainer/node_*.log
+  All ranks:      ${LOG_DIR}/trainer/torchrun/*/*/*/*.log
+  Orchestrator:   ${LOG_DIR}/orchestrator.log
+  Inference:      ${LOG_DIR}/inference.log
+  Envs:           ${LOG_DIR}/envs/*/*/*.log
+  Train envs:     ${LOG_DIR}/envs/train/*/*.log
+You are running inside tmux session \"${SESSION_NAME}\". The Launcher window (window 0) is where the user runs launch commands. You can read its contents with: tmux capture-pane -t ${SESSION_NAME}:Launcher -p
+Help the user monitor and debug this run.'" C-m
+
+# Pane title styling
+tmux set-option -t "$SESSION_NAME" -g pane-border-status top
+tmux set-option -t "$SESSION_NAME" -g pane-border-format " #{pane_title} "
+
+# Focus launcher window and attach
+tmux select-window -t "$SESSION_NAME:Launcher"
+exec tmux attach-session -t "$SESSION_NAME"

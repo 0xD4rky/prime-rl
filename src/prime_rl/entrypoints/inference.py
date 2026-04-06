@@ -7,7 +7,8 @@ import tomli_w
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
-from prime_rl.utils.pathing import get_config_dir
+from prime_rl.utils.pathing import format_log_message, get_config_dir, get_log_dir
+from prime_rl.utils.process import set_proc_title
 
 INFERENCE_TOML = "inference.toml"
 INFERENCE_SBATCH = "inference.sbatch"
@@ -32,14 +33,41 @@ def write_slurm_script(config: InferenceConfig, config_path: Path, script_path: 
     env = Environment(loader=FileSystemLoader(config.slurm.template_path.parent), keep_trailing_newline=True)
     template = env.get_template(config.slurm.template_path.name)
 
-    script = template.render(
+    is_disaggregated = config.deployment.type == "disaggregated"
+
+    template_vars = dict(
         **config.slurm.template_vars,
         config_path=config_path,
         output_dir=config.output_dir,
         gpus_per_node=config.deployment.gpus_per_node,
-        num_nodes=config.deployment.num_nodes if config.deployment.type == "multi_node" else 1,
+        num_nodes=getattr(config.deployment, "num_nodes", 1),
         port=config.server.port,
+        disaggregated=is_disaggregated,
     )
+
+    is_multi_node = config.deployment.type == "multi_node"
+
+    if is_disaggregated:
+        template_vars.update(
+            num_prefill_nodes=config.deployment.num_prefill_nodes,
+            num_decode_nodes=config.deployment.num_decode_nodes,
+            num_prefill_replicas=config.deployment.num_prefill_replicas,
+            num_decode_replicas=config.deployment.num_decode_replicas,
+            prefill_port=config.deployment.prefill_port,
+            decode_port=config.deployment.decode_port,
+            router_port=config.deployment.router_port,
+            data_parallel_rpc_port=config.data_parallel_rpc_port,
+            use_deep_gemm=config.use_deep_gemm,
+            prefill_env_overrides=config.deployment.prefill_env_overrides,
+            decode_env_overrides=config.deployment.decode_env_overrides,
+        )
+    elif is_multi_node:
+        template_vars.update(
+            router_port=config.deployment.router_port,
+            backend_port=config.deployment.backend_port,
+        )
+
+    script = template.render(**template_vars)
 
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text(script)
@@ -52,7 +80,11 @@ def inference_slurm(config: InferenceConfig):
     logger = setup_logger("info")
 
     config_dir = get_config_dir(config.output_dir)
-    exclude = {"deployment", "slurm", "dry_run"} if config.deployment.type == "multi_node" else {"slurm", "dry_run"}
+    exclude = (
+        {"deployment", "slurm", "dry_run"}
+        if config.deployment.type in ("multi_node", "disaggregated")
+        else {"slurm", "dry_run"}
+    )
     config_path = write_config(config, config_dir, exclude=exclude)
     logger.info(f"Wrote config to {config_path}")
 
@@ -60,11 +92,9 @@ def inference_slurm(config: InferenceConfig):
     write_slurm_script(config, config_path, script_path)
     logger.info(f"Wrote SLURM script to {script_path}")
 
-    log_message = (
-        f"Logs:\n"
-        f"  Job:        tail -F {config.output_dir}/job_*.log\n"
-        f"  Inference:  tail -F {config.output_dir}/slurm/latest_infer_node_rank_*.log\n"
-    )
+    log_dir = get_log_dir(config.output_dir)
+    num_nodes = getattr(config.deployment, "num_nodes", 1)
+    log_message = format_log_message(log_dir=log_dir, inference=True, job_log=True, num_infer_nodes=num_nodes)
 
     if config.dry_run:
         logger.success(f"Dry run complete. To submit manually:\n\n  sbatch {script_path}\n\n{log_message}")
@@ -108,6 +138,7 @@ def inference(config: InferenceConfig):
 
 
 def main():
+    set_proc_title("Inference")
     inference(cli(InferenceConfig))
 
 

@@ -169,7 +169,11 @@ class DataLoader:
 
     def wait_for_batch(self) -> None:
         if self.world.is_master:
-            self.packer.pack()
+            self.packer._arm_watchdog()
+            try:
+                self.packer.pack()
+            finally:
+                self.packer._disarm_watchdog()
         self.receiver.wait()
         self.multi_run_manager.synchronize_state()
 

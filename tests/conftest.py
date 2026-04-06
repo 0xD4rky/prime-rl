@@ -1,5 +1,6 @@
 import os
 import shutil
+import signal
 import socket
 import subprocess
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 
 from prime_rl.trainer.world import reset_world
 from prime_rl.utils.logger import reset_logger, setup_logger
+from prime_rl.utils.process import cleanup_process
 
 
 @pytest.fixture(autouse=True)
@@ -116,11 +118,11 @@ def run_process() -> Callable[[Command, Environment, int], ProcessResult]:
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            process.terminate()
+            cleanup_process(process.pid, signal.SIGTERM)
             try:
-                process.wait(timeout=10)  # Give it 10 seconds to terminate gracefully
+                process.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                process.kill()
+                cleanup_process(process.pid, signal.SIGKILL)
                 process.wait()
 
         return ProcessResult(process)

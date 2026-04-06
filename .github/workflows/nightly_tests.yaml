@@ -56,7 +56,7 @@ jobs:
         needs: discover-experiments
         runs-on: research-cluster
         container:
-            image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+            image: pytorch/pytorch:2.10.0-cuda13.0-cudnn9-devel
             options: --gpus all
         timeout-minutes: 1440 # 24 hours
         strategy:

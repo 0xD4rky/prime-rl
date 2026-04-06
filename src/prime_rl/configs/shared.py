@@ -80,6 +80,37 @@ class SlurmConfig(BaseConfig):
 ServerType = Literal["vllm", "openai"]
 
 
+class VLMConfig(BaseConfig):
+    """Configures vision-language model support.
+
+    Presence of this config enables VLM mode. You must specify where the
+    vision encoder and language model live on the model object.
+
+    Usage:
+        [model.vlm]
+        vision_encoder_attr = "model.visual"
+        language_model_attr = "model.language_model"
+    """
+
+    vision_encoder_attr: Annotated[
+        str,
+        Field(description="Dotted attribute path to the vision encoder module (e.g. 'model.visual')."),
+    ]
+
+    language_model_attr: Annotated[
+        str,
+        Field(description="Dotted attribute path to the language model module (e.g. 'model.language_model')."),
+    ]
+
+    freeze_vision_encoder: Annotated[
+        bool,
+        Field(
+            description="Whether to freeze the vision encoder. When False, the vision encoder is trainable "
+            "and FSDP-sharded per-block. Has no effect with LoRA (LoRA freezes all non-adapter parameters).",
+        ),
+    ] = True
+
+
 class BaseModelConfig(BaseConfig):
     """Configures the model."""
 
@@ -91,6 +122,13 @@ class BaseModelConfig(BaseConfig):
             description="Whether to trust remote code for tokenizer initialization.",
         ),
     ] = False
+
+    vlm: Annotated[
+        "VLMConfig | None",
+        Field(
+            description="VLM configuration. Set this to enable vision-language model support.",
+        ),
+    ] = None
 
 
 class ElasticConfig(BaseConfig):
@@ -166,6 +204,15 @@ class ClientConfig(BaseConfig):
         ),
     ] = {}
 
+    extra_headers_from_state: Annotated[
+        dict[str, str],
+        Field(
+            description="Maps HTTP header names to state field names. For each inference request, "
+            "the header value is dynamically read from the rollout state dict. "
+            'e.g. {"X-Session-ID": "example_id"} enables sticky routing at the inference router.',
+        ),
+    ] = {}
+
     skip_model_check: Annotated[
         bool,
         Field(
@@ -189,10 +236,27 @@ class ClientConfig(BaseConfig):
         ),
     ] = 1
 
+    admin_base_url: Annotated[
+        list[str] | None,
+        Field(
+            description="Separate base URLs for admin operations (weight updates, health checks). "
+            "When set, admin clients use these URLs instead of base_url, allowing weight "
+            "updates to bypass routers and hit each server directly. Used in disaggregated "
+            "P/D deployments where the inference router should not handle admin traffic.",
+        ),
+    ] = None
+
     elastic: Annotated[
         ElasticConfig | None,
         Field(
             description="Elastic inference pool configuration for DNS-based service discovery. If provided, base_url is ignored and inference servers are discovered dynamically via DNS.",
+        ),
+    ] = None
+
+    router_url: Annotated[
+        str | None,
+        Field(
+            description="URL of a vllm-router for load-aware inference routing. When set with elastic mode, inference requests go through the router while admin operations (weight updates, LoRA loading) still go directly to discovered pods.",
         ),
     ] = None
 
@@ -215,17 +279,10 @@ class LogConfig(BaseConfig):
         Field(description="Logging level for the verifiers package. Will determine the logging verbosity and format."),
     ] = "info"
 
-    file: Annotated[
+    json_logging: Annotated[
         bool,
         Field(
-            description="Whether to log to a file. If True, will log to a file in the output directory.",
-        ),
-    ] = True
-
-    env_worker_logs: Annotated[
-        bool,
-        Field(
-            description="Whether env workers log to files. If True, workers write to logs/env_workers/{env_name}.log.",
+            description="Emit JSON logs (newline-delimited) for log aggregation (Loki, Grafana, etc.).",
         ),
     ] = False
 
@@ -236,12 +293,14 @@ class LogConfig(BaseConfig):
         ),
     ] = False
 
-    json_logging: Annotated[
-        bool,
-        Field(
-            description="Emit JSON logs (newline-delimited) for log aggregation (Loki, Grafana, etc.).",
-        ),
-    ] = False
+
+class TrainerLogConfig(LogConfig):
+    """Trainer-specific log config."""
+
+    ranks_filter: Annotated[
+        list[int],
+        Field(description="Which trainer ranks to show in console output. Passed to torchrun's --local-ranks-filter."),
+    ] = [0]
 
 
 class LogExtrasConfig(BaseConfig):
@@ -269,6 +328,18 @@ class LogExtrasConfig(BaseConfig):
         ),
     ] = 10
 
+    sample_ratio: Annotated[
+        float | None,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Fraction of rollouts to log per step (0.0–1.0). "
+            "When set, the effective sample cap is len(rollouts) * sample_ratio. "
+            "1.0 = all rollouts, 0.5 = half, 0.0 = none. "
+            "None (default)",
+        ),
+    ] = None
+
 
 class WandbConfig(BaseConfig):
     """Configures logging to Weights and Biases."""
@@ -284,14 +355,6 @@ class WandbConfig(BaseConfig):
     ] = None
 
     offline: Annotated[bool, Field(description="Whether to run W&B in offline mode.")] = False
-
-    # Individual configs (can only be specified on trainer or orchestrator)
-    id: Annotated[
-        str | None,
-        Field(
-            description="The W&B run ID to log to. If None, a random ID will be generated. If you want to resume a run, you can set the ID to the run ID you want to resume.",
-        ),
-    ] = None
 
 
 class WandbWithExtrasConfig(WandbConfig):
@@ -313,7 +376,7 @@ class PrimeMonitorConfig(BaseConfig):
         Field(
             description="The base URL for Prime Intellect monitoring API.",
         ),
-    ] = "https://api.primeintellect.ai/api/internal/rft"
+    ] = "https://api.primeintellect.ai/api/v1/rft"
 
     api_key_var: Annotated[
         str,
@@ -328,6 +391,27 @@ class PrimeMonitorConfig(BaseConfig):
             description="Configuration for logging extras. If None, no extras are logged.",
         ),
     ] = LogExtrasConfig()
+
+    run_name: Annotated[
+        str | None,
+        Field(
+            description="Name for the run shown on the platform. Defaults to the W&B run name if set, otherwise auto-generated by the platform.",
+        ),
+    ] = None
+
+    team_id: Annotated[
+        str | None,
+        Field(
+            description="Team ID to associate the run with.",
+        ),
+    ] = None
+
+    frontend_url: Annotated[
+        str | None,
+        Field(
+            description="Frontend base URL used for the dashboard link shown after registration. Defaults to the Prime CLI frontend URL when unset.",
+        ),
+    ] = None
 
 
 class HeartbeatConfig(BaseConfig):

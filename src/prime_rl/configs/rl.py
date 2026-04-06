@@ -19,6 +19,7 @@ from prime_rl.configs.orchestrator import (
 )
 from prime_rl.configs.shared import (
     SlurmConfig,
+    VLMConfig,
     WandbConfig,
     WandbWithExtrasConfig,
 )
@@ -54,8 +55,6 @@ class SharedLogConfig(BaseConfig):
 
     level: Annotated[str | None, Field(description="The log level to use.")] = "info"
 
-    file: Annotated[bool | None, Field(description="Whether to log to a file.")] = True
-
     json_logging: Annotated[
         bool,
         Field(description="Emit JSON logs (newline-delimited) for log aggregation (Loki, Grafana, etc.)."),
@@ -70,6 +69,20 @@ class SharedWandbConfig(BaseConfig):
     name: Annotated[str | None, Field(description="The W&B run name to use.")] = None
 
     offline: Annotated[bool | None, Field(description="Whether to run W&B in offline mode.")] = False
+
+    shared: Annotated[
+        bool,
+        Field(
+            description="Use shared W&B mode to log trainer and orchestrator metrics to a single run. "
+            "Requires wandb SDK >= 0.19.9. Incompatible with offline mode.",
+        ),
+    ] = True
+
+    @model_validator(mode="after")
+    def validate_shared_not_offline(self):
+        if self.shared and self.offline:
+            raise ValueError("W&B shared mode requires server connectivity and is incompatible with offline mode")
+        return self
 
 
 class SharedCheckpointConfig(BaseConfig):
@@ -113,6 +126,11 @@ class SharedModelConfig(BaseConfig):
         Field(description="The name of the model to use."),
     ] = "Qwen/Qwen3-0.6B"
 
+    vlm: Annotated[
+        "VLMConfig | None",
+        Field(description="VLM configuration. Set to enable vision-language model support."),
+    ] = None
+
 
 class SharedWeightBroadcastConfig(BaseConfig):
     """Configures shared weight broadcast settings."""
@@ -123,6 +141,15 @@ class SharedWeightBroadcastConfig(BaseConfig):
 
     port: Annotated[int, Field(description="The port to use for NCCL weight broadcast.")] = 29501
     timeout: Annotated[int, Field(description="The timeout in seconds for NCCL weight broadcast.")] = 1200
+    quantize_in_weight_transfer: Annotated[
+        bool,
+        Field(
+            description=(
+                "Use kernel-format FP8 quantized NCCL transfer for weight updates. "
+                "When disabled, uses default HF checkpoint-format transfer."
+            ),
+        ),
+    ] = False
 
 
 class BaseDeploymentConfig(BaseModel):
@@ -163,9 +190,16 @@ class MultiNodeDeploymentConfig(BaseDeploymentConfig):
         int,
         Field(
             ge=0,
-            description="Number of inference nodes. Set to 0 to skip inference and orchestrator (requires fake data).",
+            description="Number of inference nodes per replica. Set to 0 to skip inference and orchestrator (requires fake data).",
         ),
     ]
+    num_infer_replicas: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Number of independent inference replicas. Total inference nodes = num_infer_nodes * num_infer_replicas.",
+        ),
+    ] = 1
     num_teacher_nodes: Annotated[int | None, Field(description="Number of teacher inference nodes.")] = None
 
     nodes_per_fsdp_group: Annotated[
@@ -174,6 +208,10 @@ class MultiNodeDeploymentConfig(BaseDeploymentConfig):
             description="Number of training nodes per FSDP island. Auto-sets trainer.dp_replicate = num_train_nodes / nodes_per_fsdp_group."
         ),
     ] = None
+
+    @property
+    def total_infer_nodes(self) -> int:
+        return self.num_infer_nodes * self.num_infer_replicas
 
     @model_validator(mode="after")
     def teacher_inference_not_supported(self):
@@ -339,6 +377,22 @@ class RLConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_quantize_in_weight_transfer(self):
+        if self.weight_broadcast is None or not self.weight_broadcast.quantize_in_weight_transfer:
+            return self
+
+        if self.weight_broadcast.type != "nccl":
+            raise ValueError("weight_broadcast.quantize_in_weight_transfer requires weight_broadcast.type = 'nccl'.")
+
+        if self.inference is None:
+            raise ValueError("weight_broadcast.quantize_in_weight_transfer requires an inference config.")
+
+        if self.trainer.model.impl != "custom":
+            raise ValueError("weight_broadcast.quantize_in_weight_transfer requires trainer.model.impl = 'custom'.")
+
+        return self
+
+    @model_validator(mode="after")
     def validate_teacher_model(self):
         if (
             self.trainer.loss.type == "default" and self.trainer.loss.teacher_tau > 0
@@ -347,6 +401,27 @@ class RLConfig(BaseConfig):
                 "teacher_model must be configured when teacher_tau > 0. "
                 "Either set teacher_tau = 0, set deployment.num_teacher_gpus, or configure teacher_model manually."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_external_rollout_mode(self):
+        if self.orchestrator.teacher_rollout_model is None:
+            return self
+
+        if self.trainer.loss.type != "sft":
+            raise ValueError('orchestrator.teacher_rollout_model is only supported when trainer.loss.type = "sft".')
+
+        if self.inference is not None:
+            raise ValueError(
+                "inference must be omitted when orchestrator.teacher_rollout_model is configured. "
+                "External rollout mode does not use the local inference server."
+            )
+
+        if self.orchestrator.use_token_client:
+            raise ValueError(
+                "orchestrator.use_token_client must be false when orchestrator.teacher_rollout_model is configured."
+            )
+
         return self
 
     ### Auto-setup and validate shared configs
@@ -368,9 +443,6 @@ class RLConfig(BaseConfig):
             if self.log.level is not None:
                 self.trainer.log.level = self.log.level
                 self.orchestrator.log.level = self.log.level
-            if self.log.file is not None:
-                self.trainer.log.file = self.log.file
-                self.orchestrator.log.file = self.log.file
             self.trainer.log.json_logging = self.log.json_logging
             self.orchestrator.log.json_logging = self.log.json_logging
 
@@ -426,17 +498,24 @@ class RLConfig(BaseConfig):
                 self.trainer.wandb.project = self.wandb.project
                 self.orchestrator.wandb.project = self.wandb.project
 
-            # If specified, automatically use shared W&B name for orchestrator and trainer with suffixes
-            if self.wandb.name:
-                self.trainer.wandb.name = f"{self.wandb.name}-trainer"
-                self.orchestrator.wandb.name = f"{self.wandb.name}-orchestrator"
+            if self.wandb.shared:
+                if self.wandb.name:
+                    self.trainer.wandb.name = self.wandb.name
+                    self.orchestrator.wandb.name = self.wandb.name
+            else:
+                if self.wandb.name:
+                    self.trainer.wandb.name = f"{self.wandb.name}-trainer"
+                    self.orchestrator.wandb.name = f"{self.wandb.name}-orchestrator"
 
-            # If specified, automatically use shared W&B offline mode for orchestrator and trainer
             if self.wandb.offline:
                 self.trainer.wandb.offline = self.wandb.offline
                 self.orchestrator.wandb.offline = self.wandb.offline
 
         validate_shared_wandb_config(self.trainer, self.orchestrator)
+
+        if self.orchestrator.prime_monitor is not None and self.orchestrator.prime_monitor.run_name is None:
+            if self.wandb and self.wandb.name:
+                self.orchestrator.prime_monitor.run_name = self.wandb.name
 
         return self
 
@@ -445,9 +524,19 @@ class RLConfig(BaseConfig):
         """Auto-setup shared model config for trainer, orchestrator, and inference."""
         if self.model is not None:
             self.trainer.model.name = self.model.name
-            self.orchestrator.model.name = self.model.name
             if self.inference is not None:
-                self.inference.model.name = self.model.name
+                inference_model_explicitly_set = "name" in self.inference.model.model_fields_set
+                if not inference_model_explicitly_set:
+                    self.inference.model.name = self.model.name
+                self.orchestrator.model.name = self.inference.model.name
+            else:
+                self.orchestrator.model.name = self.model.name
+
+            if self.model.vlm is not None:
+                self.trainer.model.vlm = self.model.vlm
+                self.orchestrator.model.vlm = self.model.vlm
+                if self.inference is not None:
+                    self.inference.model.vlm = self.model.vlm
 
         validate_shared_model_name(self.trainer, self.orchestrator, self.inference)
 
@@ -507,11 +596,14 @@ class RLConfig(BaseConfig):
                     inference_world_size=inference_world_size,
                     port=self.weight_broadcast.port,
                     timeout=self.weight_broadcast.timeout,
+                    quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
                 self.orchestrator.weight_broadcast = OrchestratorNCCLWeightBroadcastConfig(
                     type=self.weight_broadcast.type,
                     port=self.weight_broadcast.port,
                     timeout=self.weight_broadcast.timeout,
+                    inference_world_size=inference_world_size,
+                    quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
             elif self.weight_broadcast.type == "filesystem":
                 self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig()
@@ -595,6 +687,13 @@ class RLConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def auto_setup_session_headers(self):
+        """Auto-configure X-Session-ID header for sticky routing at the inference router."""
+        if "extra_headers_from_state" not in self.orchestrator.client.model_fields_set:
+            self.orchestrator.client.extra_headers_from_state = {"X-Session-ID": "example_id"}
+        return self
+
+    @model_validator(mode="after")
     def auto_setup_router_replay(self):
         if self.trainer.enable_router_replay:
             if self.inference is not None:
@@ -613,7 +712,7 @@ class RLConfig(BaseConfig):
     def auto_setup_deployment(self):
         if self.deployment.type == "single_node":  # single-node
             # set num_train_workers to the number of data replicas
-            non_data_parallel_size = self.trainer.model.cp * self.trainer.model.tp
+            non_data_parallel_size = self.trainer.model.cp
             if self.deployment.num_train_gpus > 1:
                 self.orchestrator.num_train_workers = self.deployment.num_train_gpus // non_data_parallel_size
 
@@ -639,7 +738,11 @@ class RLConfig(BaseConfig):
                     self.deployment.num_train_nodes // self.deployment.nodes_per_fsdp_group
                 )
 
-            if self.inference is not None and self.inference.enable_expert_parallel:
+            if (
+                self.inference is not None
+                and self.inference.enable_expert_parallel
+                and self.inference.deployment.type != "disaggregated"
+            ):
                 inference_tp = self.inference.parallel.tp
                 if self.deployment.gpus_per_node % inference_tp != 0:
                     raise ValueError(
@@ -668,11 +771,38 @@ class RLConfig(BaseConfig):
                     self.inference.api_server_count = inferred_dp_local
 
             if self.weight_broadcast is not None and self.weight_broadcast.type == "nccl":
+                total_infer_gpus = self.deployment.gpus_per_node * self.deployment.total_infer_nodes
                 assert self.trainer.weight_broadcast.type == "nccl"
                 self.trainer.weight_broadcast.host = "0.0.0.0"
-                self.trainer.weight_broadcast.inference_world_size = (
-                    self.deployment.gpus_per_node * self.deployment.num_infer_nodes
-                )
+                self.trainer.weight_broadcast.inference_world_size = total_infer_gpus
+                assert self.orchestrator.weight_broadcast.type == "nccl"
+                self.orchestrator.weight_broadcast.inference_world_size = total_infer_gpus
+
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_disaggregated_inference(self):
+        """Auto-setup for disaggregated P/D inference within a multi-node deployment."""
+        if self.inference is None or self.inference.deployment.type != "disaggregated":
+            return self
+        if self.deployment.type != "multi_node":
+            return self
+
+        infer_deploy = self.inference.deployment
+        expected_infer_nodes = infer_deploy.num_prefill_nodes + infer_deploy.num_decode_nodes
+        if self.deployment.num_infer_nodes != expected_infer_nodes:
+            raise ValueError(
+                f"deployment.num_infer_nodes ({self.deployment.num_infer_nodes}) must equal "
+                f"inference.deployment.num_prefill_nodes ({infer_deploy.num_prefill_nodes}) + "
+                f"inference.deployment.num_decode_nodes ({infer_deploy.num_decode_nodes}) = {expected_infer_nodes}"
+            )
+
+        total_infer_gpus = self.deployment.total_infer_nodes * self.deployment.gpus_per_node
+        if self.weight_broadcast is not None and self.weight_broadcast.type == "nccl":
+            assert self.trainer.weight_broadcast.type == "nccl"
+            self.trainer.weight_broadcast.inference_world_size = total_infer_gpus
+            assert self.orchestrator.weight_broadcast.type == "nccl"
+            self.orchestrator.weight_broadcast.inference_world_size = total_infer_gpus
 
         return self
 

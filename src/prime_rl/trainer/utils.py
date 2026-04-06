@@ -1,3 +1,4 @@
+import gc
 import json
 import pickle
 import shutil
@@ -25,6 +26,33 @@ from prime_rl.utils.pathing import get_ckpt_dir
 from prime_rl.utils.utils import format_num, format_time, get_step_path
 
 DEFAULT_TIMEOUT = timedelta(seconds=600)
+
+
+class GarbageCollection:
+    """Controls Python garbage collection to avoid stragglers in distributed training.
+
+    In multi-GPU training, Python's automatic GC can trigger unpredictably on one rank
+    while others wait at a synchronization point, stalling the entire step. This class
+    disables automatic GC and runs deterministic collections every `interval` steps so
+    all ranks collect simultaneously.
+
+    Based on the approach from torchtitan (https://arxiv.org/abs/2505.05713).
+    """
+
+    def __init__(self, interval: int = 50):
+        assert interval > 0, "gc interval must be a positive integer"
+        self.interval = interval
+        gc.disable()
+        self._collect()
+
+    def run(self, step: int):
+        if step > 0 and step % self.interval == 0:
+            self._collect()
+
+    def _collect(self, generation: int = 1):
+        begin = time.monotonic()
+        gc.collect(generation)
+        get_logger().info(f"[GC] collection took {time.monotonic() - begin:.2f}s")
 
 
 def _to_local_tensor(tensor: Tensor | DTensor) -> Tensor:
@@ -352,6 +380,33 @@ class Tensors(defaultdict):
             self[key].append(tensors.tolist())
 
         return metrics
+
+
+def filter_rl_trainer_tensor_stats_for_wandb(metrics: dict[str, float | int]) -> dict[str, float | int]:
+    """Drop noisy per-token distribution keys before sending RL trainer stats to W&B."""
+    skip_prefixes = ("trainer_probs/", "inference_probs/")
+    mean_max_only_prefixes = (
+        "is_masked/",
+        "is_masked_low/",
+        "is_masked_high/",
+        "mismatch_kl/",
+        "masked_mismatch_kl/",
+        "unmasked_mismatch_kl/",
+    )
+    out: dict[str, float | int] = {}
+    for k, v in metrics.items():
+        if k == "step":
+            out[k] = v
+            continue
+        if any(k.startswith(p) for p in skip_prefixes):
+            continue
+        if k.startswith("entropy/") and k != "entropy/mean":
+            continue
+        if any(k.startswith(p) for p in mean_max_only_prefixes):
+            if not (k.endswith("/mean") or k.endswith("/max")):
+                continue
+        out[k] = v
+    return out
 
 
 MEMORY_SNAPSHOT_MAX_ENTRIES = 100000

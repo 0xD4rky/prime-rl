@@ -47,8 +47,8 @@ def get_eval_sampling_args(sampling_config: EvalSamplingConfig) -> dict[str, Any
     # Apply sampling arguments, if specified
     if sampling_config.temperature is not None:
         sampling_args["temperature"] = sampling_config.temperature
-    if sampling_config.max_tokens is not None:
-        sampling_args["max_tokens"] = sampling_config.max_tokens
+    if sampling_config.max_completion_tokens is not None:
+        sampling_args["max_completion_tokens"] = sampling_config.max_completion_tokens
     if sampling_config.top_p is not None:
         sampling_args["top_p"] = sampling_config.top_p
     if sampling_config.reasoning_effort is not None:
@@ -103,6 +103,7 @@ async def evaluate_env(
     logger = get_logger()
     logger.info(f"Evaluating {env_name} ({num_examples=}, {rollouts_per_example=})")
     eval_start_time = time.perf_counter()
+    total_inputs = len(env._get_eval_inputs(num_examples, rollouts_per_example))
     outputs = await evaluate(
         env=env,
         model_name=model_name,
@@ -113,6 +114,16 @@ async def evaluate_env(
         max_retries=max_retries,
     )
     eval_time = time.perf_counter() - eval_start_time
+    failed_rollouts = total_inputs - len(outputs)
+
+    if not outputs:
+        logger.warning(f"All rollouts failed for {env_name} ({failed_rollouts} failed), skipping metrics")
+        monitor = get_monitor()
+        monitor.log(
+            {f"eval/{env_name}/failed_rollouts": failed_rollouts, "progress/ckpt_step": ckpt_step, "step": step},
+            step=step,
+        )
+        return
 
     rows = []
     for output in outputs:
@@ -162,6 +173,7 @@ async def evaluate_env(
         "completion_len/max": results_df.completion_len.max().item(),
         "completion_len/min": results_df.completion_len.min().item(),
         "is_truncated/mean": results_df.is_truncated.mean().item(),
+        "failed_rollouts": failed_rollouts,
         "time": eval_time,
     }
     if could_be_binary:
@@ -171,3 +183,4 @@ async def evaluate_env(
     eval_metrics.update({"progress/ckpt_step": ckpt_step, "step": step})
     monitor = get_monitor()
     monitor.log(eval_metrics, step=step)
+    monitor.log_eval_samples(outputs, env_name=env_name, step=step)

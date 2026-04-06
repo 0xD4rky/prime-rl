@@ -11,6 +11,7 @@ from torch.optim import SGD, AdamW, Optimizer
 from prime_rl.configs.trainer import OptimizerConfig
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.runs import get_multi_run_manager
+from prime_rl.trainer.sign_sgd import SignSGD
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
 
@@ -166,6 +167,12 @@ def _create_optimizer(
             )
         case "muon":
             return _create_muon_optimizer(config, named_params, parallel_dims, lr)
+        case "sign_sgd":
+            return SignSGD(
+                params=[p for _, p in named_params],
+                lr=lr,
+                weight_decay=config.weight_decay,
+            )
 
 
 def _create_muon_optimizer(

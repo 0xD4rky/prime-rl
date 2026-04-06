@@ -1,4 +1,6 @@
+import os
 import shutil
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -19,6 +21,7 @@ from prime_rl.utils.logger import get_logger
 from prime_rl.utils.pathing import get_rollout_dir
 
 TIMEOUT_SECONDS = 0.1
+WATCHDOG_TIMEOUT_SECONDS = 1800  # 30 minutes
 
 
 class BasePacker(ABC):
@@ -42,6 +45,30 @@ class BasePacker(ABC):
         self.sender: MicroBatchSender = setup_micro_batch_sender(
             self.multi_run_manager.output_dir, dp_world_size, start_step, config
         )
+        self._last_heartbeat = time.monotonic()
+        self._watchdog_armed = threading.Event()
+        self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog.start()
+
+    def _heartbeat(self) -> None:
+        self._last_heartbeat = time.monotonic()
+
+    def _arm_watchdog(self) -> None:
+        self._last_heartbeat = time.monotonic()
+        self._watchdog_armed.set()
+
+    def _disarm_watchdog(self) -> None:
+        self._watchdog_armed.clear()
+
+    def _watchdog_loop(self) -> None:
+        while True:
+            time.sleep(60)
+            if not self._watchdog_armed.is_set():
+                continue
+            stale = time.monotonic() - self._last_heartbeat
+            if stale > WATCHDOG_TIMEOUT_SECONDS:
+                self.logger.error(f"Packer heartbeat stale for {stale:.0f}s, killing process to trigger restart")
+                os._exit(1)
 
     @abstractmethod
     def pack(self) -> None:
@@ -66,6 +93,7 @@ class SinglePacker(BasePacker):
         # Wait for batch to be available
         batches = []
         while len(batches) == 0:
+            self._heartbeat()
             self.multi_run_manager.discover_runs()
             batches = self.receiver.receive()
             time.sleep(0.2)
@@ -157,6 +185,7 @@ class MultiPacker(BasePacker):
 
     def _get_batch(self) -> None:
         """Receive batches from orchestrator and buffer samples per run."""
+        self._heartbeat()
         self.multi_run_manager.discover_runs()
         batches = self.receiver.receive()
 

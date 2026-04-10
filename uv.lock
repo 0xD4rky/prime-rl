@@ -631,17 +631,17 @@ wheels = [
 [[package]]
 name = "deep-ep"
 version = "1.2.1+73b6ea4"
-source = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl" }
+source = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl" }
 wheels = [
-    { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl", hash = "sha256:ddf25e5d9c8543d27d7ae7a62ff7752560bf79c03c5991d48721352818b320d3" },
+    { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl", hash = "sha256:ddf25e5d9c8543d27d7ae7a62ff7752560bf79c03c5991d48721352818b320d3" },
 ]
 
 [[package]]
 name = "deep-gemm"
 version = "2.3.0+477618c"
-source = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/deep_gemm-2.3.0+477618c-cp312-cp312-linux_x86_64.whl" }
+source = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/deep_gemm-2.3.0+477618c-cp312-cp312-linux_x86_64.whl" }
 wheels = [
-    { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/deep_gemm-2.3.0+477618c-cp312-cp312-linux_x86_64.whl", hash = "sha256:a40cea03705cfa50eefe5651d91e3e7ebf87a53acf06cde8bbb877fb95f0f921" },
+    { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/deep_gemm-2.3.0+477618c-cp312-cp312-linux_x86_64.whl", hash = "sha256:a40cea03705cfa50eefe5651d91e3e7ebf87a53acf06cde8bbb877fb95f0f921" },
 ]
 
 [[package]]
@@ -890,24 +890,17 @@ requires-dist = [
 
 [[package]]
 name = "flash-attn-3"
-version = "3.0.0b1"
-source = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.1/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" }
+version = "3.0.0"
+source = { registry = "https://download.pytorch.org/whl/test/cu128" }
 dependencies = [
-    { name = "einops", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "ninja", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "packaging", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "einops", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "ninja", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "packaging", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "torch", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.1/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl", hash = "sha256:4878b0e81704972109479f0667b2ace65f62e62a1161c9dbc23fa746889c79e4" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "einops" },
-    { name = "ninja" },
-    { name = "packaging" },
-    { name = "torch" },
+    { url = "https://download.pytorch.org/whl/test/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:10a730d5e1a1c23afd930ce419ee425cd1925a16b7eac789dfe98c3ca39bc009" },
+    { url = "https://download.pytorch.org/whl/test/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:bbb51d13d7aa1bfe04ef8875ed1bf630ebb116775084a5df612495e10609cd76" },
 ]
 
 [[package]]
@@ -1505,6 +1498,20 @@ wheels = [
 ]
 
 [[package]]
+name = "kernels"
+version = "0.12.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "packaging", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "pyyaml", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b3/84/9f68f355f6ce99e977872021fbdbafadcf2820f51d3f7bd697ec3801cb7a/kernels-0.12.3.tar.gz", hash = "sha256:87e29716578e7e71dc5a7578e0132bfdae305bedaeb602698f87c88ca6c60e32", size = 57407, upload-time = "2026-03-20T10:20:42.166Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/3e/778e4a86830e9139df2d16d86c4488fce426ec19daa83cbd2854ef389030/kernels-0.12.3-py3-none-any.whl", hash = "sha256:5d1d33fcb774e03bb7f0688ac24d91ef6b963692f80f0a85ddd2286e69f3cf2f", size = 55501, upload-time = "2026-03-20T10:20:40.643Z" },
+]
+
+[[package]]
 name = "kubernetes"
 version = "35.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2014,7 +2021,7 @@ version = "0.10.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nixl-cu12", version = "0.10.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "nixl-cu12", version = "0.10.1", source = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nixl-cu12", version = "0.10.1", source = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/a4/10e80e623790d3fb070e966b36bced009419d483c92ae0df6645230f606f/nixl-0.10.1-py3-none-any.whl", hash = "sha256:616465673dae5180d296525a03237af4cd5f2c00c3228d185bc06dbe621509b7", size = 6680, upload-time = "2026-03-03T19:55:44.848Z" },
@@ -2038,7 +2045,7 @@ wheels = [
 [[package]]
 name = "nixl-cu12"
 version = "0.10.1"
-source = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }
+source = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
@@ -2047,7 +2054,7 @@ dependencies = [
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl", hash = "sha256:bd01eb9e52f1affee3330062baa2f3bea7d711664f7cb602bf5d3f694daeb796" },
+    { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl", hash = "sha256:bd01eb9e52f1affee3330062baa2f3bea7d711664f7cb602bf5d3f694daeb796" },
 ]
 
 [package.metadata]
@@ -2701,6 +2708,7 @@ dependencies = [
     { name = "liger-kernel", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "loguru", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "numpy", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "nvidia-ml-py", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "openai", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "prime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "pyarrow", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -2730,7 +2738,7 @@ all = [
     { name = "deep-gemm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-    { name = "nixl-cu12", version = "0.10.1", source = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nixl-cu12", version = "0.10.1", source = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "quack-kernels", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "vllm-router", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
@@ -2738,7 +2746,7 @@ disagg = [
     { name = "deep-ep", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "deep-gemm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-    { name = "nixl-cu12", version = "0.10.1", source = { url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nixl-cu12", version = "0.10.1", source = { url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "vllm-router", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 envs = [
@@ -2761,10 +2769,13 @@ flash-attn = [
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 flash-attn-3 = [
-    { name = "flash-attn-3", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "flash-attn-3", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 flash-attn-cute = [
     { name = "flash-attn-4", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+]
+gpt-oss = [
+    { name = "kernels", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 quack = [
     { name = "quack-kernels", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -2792,15 +2803,16 @@ requires-dist = [
     { name = "code-env", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "color-codeword", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "datasets", specifier = ">=4.0.0" },
-    { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl" },
-    { name = "deep-gemm", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/deep_gemm-2.3.0+477618c-cp312-cp312-linux_x86_64.whl" },
+    { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl" },
+    { name = "deep-gemm", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/deep_gemm-2.3.0+477618c-cp312-cp312-linux_x86_64.whl" },
     { name = "deepdive", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "dion", git = "https://github.com/samsja/dion.git?rev=d891eeb" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and extra == 'flash-attn'", url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp312-cp312-linux_x86_64.whl" },
-    { name = "flash-attn-3", marker = "platform_machine == 'x86_64' and extra == 'flash-attn-3'", url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.1/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" },
+    { name = "flash-attn-3", marker = "extra == 'flash-attn-3'", index = "https://download.pytorch.org/whl/test/cu128" },
     { name = "flash-attn-4", marker = "extra == 'flash-attn-cute'", git = "https://github.com/Dao-AILab/flash-attention.git?subdirectory=flash_attn%2Fcute&rev=abd9943b" },
     { name = "flash-linear-attention", git = "https://github.com/fla-org/flash-linear-attention" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
+    { name = "kernels", marker = "extra == 'gpt-oss'" },
     { name = "liger-kernel", specifier = ">=0.5.10" },
     { name = "logic-env", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "loguru", specifier = ">=0.7.3" },
@@ -2809,8 +2821,9 @@ requires-dist = [
     { name = "math500", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "mini-swe-agent-plus", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "nixl", marker = "extra == 'disagg'" },
-    { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" },
+    { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/samsja/research-pre-built-wheels/releases/download/v0.2/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" },
     { name = "numpy", specifier = ">=2.2.6" },
+    { name = "nvidia-ml-py", specifier = ">=12.575.51" },
     { name = "openai", specifier = ">=1.106.1" },
     { name = "prime", specifier = ">=0.5.37" },
     { name = "prime-rl", extras = ["disagg"], marker = "extra == 'all'" },
@@ -2837,11 +2850,11 @@ requires-dist = [
     { name = "uvloop", specifier = ">=0.21.0" },
     { name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=0760204" },
     { name = "vllm", specifier = ">=0.19.0" },
-    { name = "vllm-router", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.14/vllm_router-0.1.14-cp38-abi3-linux_x86_64.whl" },
+    { name = "vllm-router", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.18/vllm_router-0.1.16-cp38-abi3-manylinux_2_28_x86_64.whl" },
     { name = "wandb", specifier = ">=0.24.2" },
     { name = "wiki-search", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
 ]
-provides-extras = ["flash-attn", "flash-attn-3", "flash-attn-cute", "envs", "disagg", "quack", "all"]
+provides-extras = ["flash-attn", "flash-attn-3", "flash-attn-cute", "envs", "disagg", "gpt-oss", "quack", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3832,8 +3845,8 @@ dependencies = [
     { name = "typing-extensions", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6f09cdf2415516be028ae82e6b985bcfc3eac37bc52ab401142689f6224516ca" },
-    { url = "https://download.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:628e89bd5110ced7debee2a57c69959725b7fbc64eab81a39dd70e46c7e28ba5" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6f09cdf2415516be028ae82e6b985bcfc3eac37bc52ab401142689f6224516ca" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:628e89bd5110ced7debee2a57c69959725b7fbc64eab81a39dd70e46c7e28ba5" },
 ]
 
 [[package]]
@@ -4243,8 +4256,8 @@ wheels = [
 
 [[package]]
 name = "vllm-router"
-version = "0.1.14"
-source = { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.14/vllm_router-0.1.14-cp38-abi3-linux_x86_64.whl" }
+version = "0.1.16"
+source = { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.18/vllm_router-0.1.16-cp38-abi3-manylinux_2_28_x86_64.whl" }
 dependencies = [
     { name = "aiohttp", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "fastapi", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -4254,7 +4267,7 @@ dependencies = [
     { name = "uvicorn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.14/vllm_router-0.1.14-cp38-abi3-linux_x86_64.whl", hash = "sha256:92935a8be0dd642aa8f328388211f7e45385d0cef6e1a851ef6d15e4153f2cae" },
+    { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.18/vllm_router-0.1.16-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:8bea20e6bbb1792208204d034d68c9a88872a812af2734f27f700738c1070d89" },
 ]
 
 [package.metadata]

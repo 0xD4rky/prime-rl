@@ -1,3 +1,7 @@
+import torch
+from vllm.triton_utils import tl, triton
+
+
 def transformers_v5_compat():
     """vLLM general plugin: patch transformers v5 config attrs that vLLM 0.16 still expects.
 
@@ -10,7 +14,163 @@ def transformers_v5_compat():
         Qwen3VLMoeTextConfig.tie_word_embeddings = False
 
     _patch_qwen35_lora()
+    _patch_lora_key_prefix()
+    monkey_patch_deep_gemm_ep_scatter()
     monkey_patch_dp_engine_core_pause_resume_deadlock()
+
+
+@triton.jit
+def _apply_expert_map_triton(expert_id, expert_map):
+    if expert_id != -1:
+        expert_id = tl.load(expert_map + expert_id).to(expert_id.dtype)
+    return expert_id
+
+
+@triton.jit
+def _fwd_kernel_ep_scatter_2_int64(
+    total_token_num,
+    expert_start_loc,
+    recv_x,
+    recv_x_stride0,
+    recv_x_stride1,
+    recv_x_scale,
+    recv_x_scale_stride0,
+    recv_x_scale_stride1,
+    recv_topk,
+    recv_topk_stride0,
+    recv_topk_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_stride1,
+    output_tensor_scale,
+    output_tensor_scale_stride0,
+    output_tensor_scale_stride1,
+    output_index,
+    output_index_stride0,
+    output_index_stride1,
+    topk_num: tl.constexpr,
+    expert_map,
+    HAS_EXPERT_MAP: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    HIDDEN_SIZE_PAD: tl.constexpr,
+    SCALE_HIDDEN_SIZE: tl.constexpr,
+    SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+):
+    start_token_id = tl.program_id(0)
+    grid_num = tl.num_programs(0)
+
+    offset_in = tl.arange(0, HIDDEN_SIZE_PAD)
+    mask = offset_in < HIDDEN_SIZE
+
+    offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
+    mask_s = offset_in_s < SCALE_HIDDEN_SIZE
+
+    output_tensor_stride0 = output_tensor_stride0.to(tl.int64)
+
+    for token_id in range(start_token_id, total_token_num, grid_num):
+        to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
+        to_copy_s = tl.load(
+            recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s,
+            mask=mask_s,
+        )
+
+        for topk_index in tl.range(0, topk_num, 1, num_stages=4):
+            expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
+
+            if HAS_EXPERT_MAP:
+                expert_id = _apply_expert_map_triton(expert_id, expert_map)
+
+            if expert_id >= 0:
+                dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_i64 = dest_token_index.to(tl.int64)
+
+                tl.store(
+                    output_index + token_id * output_index_stride0 + topk_index,
+                    dest_token_index,
+                )
+
+                output_tensor_ptr = output_tensor + dest_token_index_i64 * output_tensor_stride0
+                output_tensor_scale_ptr = output_tensor_scale + dest_token_index * output_tensor_scale_stride0
+                tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
+                tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
+
+
+def _triton_ep_scatter_int64(
+    recv_x: torch.Tensor,
+    recv_x_scale: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import deep_gemm_utils
+
+    block_e = 128
+    num_warps = 8
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    hidden_size = recv_x.shape[1]
+
+    assert m_indices.shape[0] % block_e == 0
+    assert expert_start_loc.shape[0] == num_experts
+
+    deep_gemm_utils._fwd_kernel_ep_scatter_1[(num_experts,)](
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=num_warps,
+        BLOCK_E=block_e,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+    _fwd_kernel_ep_scatter_2_int64[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0),
+        recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        expert_map=expert_map,
+        HAS_EXPERT_MAP=expert_map is not None,
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=recv_x_scale.shape[1],
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(recv_x_scale.shape[1]),
+    )
+
+
+def monkey_patch_deep_gemm_ep_scatter():
+    # Temporary local carry of the upstream fix while it is under review:
+    # issue: https://github.com/vllm-project/vllm/issues/39211
+    # PR:    https://github.com/vllm-project/vllm/pull/39213
+    from vllm.logger import init_logger
+    from vllm.model_executor.layers.fused_moe import deep_gemm_utils
+
+    logger = init_logger(__name__)
+
+    deep_gemm_utils.ep_scatter = torch.no_grad()(_triton_ep_scatter_int64)
+    logger.warning("Enabled int64-addressing Triton patch for vLLM DeepGEMM ep_scatter.")
 
 
 def _patch_qwen35_lora():
@@ -62,6 +222,147 @@ def _patch_qwen35_lora():
         ]
 
     MergedColumnParallelLinearWithShardedLoRA.slice_lora_a = slice_lora_a
+
+
+def _patch_lora_key_prefix():
+    """Patch vLLM's LoRA loading to handle keys without base_model.model. prefix.
+
+    This is a copy of the upstream patch: https://github.com/vllm-project/vllm/pull/38522
+    We can remove this patch once that PR makes it into a release.
+    """
+    from vllm.lora.lora_model import (
+        LoRAModel,
+        PEFTHelper,
+        TensorizerConfig,
+        WeightsMapper,
+        get_lora_id,
+        is_base_embedding_weights,
+        os,
+        parse_fine_tuned_lora_name,
+        safetensors,
+    )
+
+    def _patched_from_local_checkpoint(
+        cls,
+        lora_dir: str,
+        expected_lora_modules: set[str],
+        peft_helper: PEFTHelper,
+        *,
+        lora_model_id: int | None = None,
+        device: str = "cuda",
+        dtype: torch.dtype | None = None,
+        model_vocab_size: int | None = None,
+        weights_mapper: WeightsMapper | None = None,
+        tensorizer_config_dict: dict | None = None,
+        skip_prefixes: list[str] | None = None,
+    ) -> "LoRAModel":
+        """Create a LoRAModel from a local checkpoint.
+
+        Args:
+            lora_dir: The local path that has lora data.
+            expected_lora_modules: Name of modules that are expected to be
+                replaced by lora.
+            peft_helper: Loaded lora configuration information.
+            lora_model_id: LoRA model id. If not given, automatically set by
+                a global counter.
+            device: Device where the lora model is loaded.
+            dtype: dtype of the lora model weights.
+            skip_prefixes: List of module name prefixes to skip during loading.
+                Models can define this to skip modules not used in inference
+                (e.g., MTP layers). Format: ["mtp."]
+
+        Returns:
+            Loaded LoRA Model.
+        """
+        lora_tensor_path = os.path.join(lora_dir, "adapter_model.safetensors")
+        lora_bin_file_path = os.path.join(lora_dir, "adapter_model.bin")
+        lora_pt_file_path = os.path.join(lora_dir, "adapter_model.pt")
+
+        tensors: dict[str, torch.Tensor] = {}
+        unexpected_modules: list[list[str] | str] = []
+
+        def check_unexpected_modules(modules: dict):
+            for lora_module in modules.keys():  # noqa
+                if is_base_embedding_weights(lora_module):
+                    continue
+                # Handle PEFT file format where experts.base_layer is the
+                # gate_up_proj and experts is the down_proj
+                if "base_layer" in lora_module:
+                    continue
+                # Skip modules based on model-defined prefixes
+                if skip_prefixes and cls._should_skip_module(lora_module, skip_prefixes):
+                    continue
+                module_name, _ = parse_fine_tuned_lora_name(lora_module, weights_mapper)
+                # Case for expert lora weights.
+                # For standard MoE models the name ends in "...experts",
+                # so expert_idx+1 yields "experts" which is in
+                # expected_lora_modules.
+                # For Qwen 3.5 MoE (and similar models) the expert index
+                # is embedded: "...experts.N.down_proj".  Taking everything
+                # after ".experts" gives "experts.N.down_proj" which is
+                # never in the expected set even though "down_proj" is.
+                # Fix: always compare just the last component of the path.
+                if ".experts" in module_name:
+                    expert_suffix = module_name.split(".")[-1]
+                    if expert_suffix not in expected_lora_modules:
+                        unexpected_modules.append(module_name)
+
+                elif module_name.rsplit(".", 1)[-1] not in expected_lora_modules:
+                    unexpected_modules.append(module_name)
+
+            if unexpected_modules:
+                raise ValueError(
+                    f"While loading {lora_dir}, expected"
+                    f" target modules in {expected_lora_modules}"
+                    f" but received {unexpected_modules}."
+                    f" Please verify that the loaded LoRA module is correct"
+                )
+
+        if tensorizer_config_dict:
+            from tensorizer import TensorDeserializer
+
+            tensorizer_config = TensorizerConfig(**tensorizer_config_dict)
+            lora_tensor_path = os.path.join(tensorizer_config.tensorizer_dir, "adapter_model.tensors")
+            tensorizer_args = tensorizer_config._construct_tensorizer_args()
+            tensors = TensorDeserializer(
+                lora_tensor_path,
+                dtype=tensorizer_config.dtype,
+                **tensorizer_args.deserialization_kwargs,
+            )
+            check_unexpected_modules(tensors)
+
+        elif os.path.isfile(lora_tensor_path):
+            # Find unexpected modules.
+            # Use safetensor key as a source of truth to find expected modules.
+            # in peft if you have target_modules A, B, C and C does not exist
+            # in the model it won’t error and model will be trained with A, B
+            # loraified. C won’t exist in the safetensor but it will exist in
+            # the target_modules of the adapter_config.json.
+            unexpected_modules = []
+            with safetensors.safe_open(lora_tensor_path, framework="pt") as f:  # type: ignore
+                # Load tensors if there are only expected modules.
+                check_unexpected_modules(f)
+                for module in f.keys():  # noqa
+                    tensors[module] = f.get_tensor(module)
+        elif os.path.isfile(lora_bin_file_path) or os.path.isfile(lora_pt_file_path):
+            lora_file_path = lora_bin_file_path if os.path.isfile(lora_bin_file_path) else lora_pt_file_path
+            tensors = torch.load(lora_file_path, map_location=device, weights_only=True)
+            check_unexpected_modules(tensors)
+        else:
+            raise ValueError(f"{lora_dir} doesn't contain tensors")
+
+        return cls.from_lora_tensors(
+            lora_model_id=get_lora_id() if lora_model_id is None else lora_model_id,
+            tensors=tensors,
+            peft_helper=peft_helper,
+            device=device,
+            dtype=dtype,
+            model_vocab_size=model_vocab_size,
+            weights_mapper=weights_mapper,
+            skip_prefixes=skip_prefixes,
+        )
+
+    LoRAModel.from_local_checkpoint = classmethod(_patched_from_local_checkpoint)
 
 
 # Monkeypatch LoadLoRAAdapter to allow loading the same adapter multiple times
@@ -650,3 +951,31 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
     DPEngineCoreProc._handle_client_request = _patched_handle_client_request
     DPEngineCoreProc.resume_scheduler = _patched_resume_scheduler
     DPEngineCoreProc._has_global_unfinished_reqs = _patched_has_global_unfinished_reqs
+
+
+def monkey_patch_no_moe_lora():
+    """This disables LoRA for MoE layers and makes them pick better kernels.
+
+    Otherwise, the oracle will always try to pick TritonExperts.
+    For blackwells, we want TRTLLMFlashInfer.
+    """
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, logger
+
+    def _patched__post_init__(self: FusedMoEConfig):
+        if self.dp_size > 1:
+            logger.debug_once("Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens)
+
+        assert self.max_num_tokens > 0
+
+        if self.router_logits_dtype is None:
+            self.router_logits_dtype = self.in_dtype
+
+        if self.hidden_dim_unpadded is None:
+            self.hidden_dim_unpadded = self.hidden_dim
+        if self.intermediate_size_per_partition_unpadded is None:
+            self.intermediate_size_per_partition_unpadded = self.intermediate_size_per_partition
+
+        # Disable LoRA for MoE layers
+        self.is_lora_enabled = False
+
+    FusedMoEConfig.__post_init__ = _patched__post_init__
